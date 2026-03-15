@@ -1,0 +1,28 @@
+inherits: base.yaml
+task: intent_classifier
+output_dir: runs/sft-intent-v1
+
+lora:
+  r: 16
+  lora_alpha: 16
+  target_modules: [q_proj, v_proj]
+
+training:
+  per_device_train_batch_size: 4
+  gradient_accumulation_steps: 4
+  num_train_epochs: 5
+  learning_rate: 2.0e-4
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  packing: true
+  max_seq_length: 512
+
+datasets:
+  - id: bitext/Bitext-customer-support-llm-chatbot-training-dataset
+    weight: 0.3
+  - id: PolyAI/banking77
+    weight: 0.3
+  - id: clinc/clinc_oos
+    weight: 0.2
+  - id: kiki_annotated
+    weight: 0.2

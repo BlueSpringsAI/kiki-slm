@@ -1,0 +1,29 @@
+inherits: base.yaml
+task: dpo_alignment
+output_dir: runs/dpo-v1
+base_model_or_adapter: runs/sft-response-v1/checkpoint-final
+
+alignment:
+  method: dpo
+  beta: 0.1
+  loss_type: sigmoid
+  learning_rate: 5.0e-6          # CRITICAL: 10-100x smaller than SFT
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  num_train_epochs: 3
+  max_length: 1536
+  max_prompt_length: 768
+
+lora:
+  r: 16
+  lora_alpha: 16
+  target_modules: all-linear
+  modules_to_save: [lm_head, embed_tokens]
+
+datasets:
+  - id: argilla/ultrafeedback-binarized-preferences-cleaned
+    weight: 0.6
+  - id: nvidia/HelpSteer3
+    weight: 0.3
+  - id: kiki_preferences
+    weight: 0.1

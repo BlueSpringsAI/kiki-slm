@@ -1,0 +1,24 @@
+model:
+  path: runs/grpo-v1/checkpoint-final
+
+test_data:
+  path: data/gold/gold_500.jsonl
+
+judge:
+  provider: openai
+  model: gpt-4o
+
+suites:
+  - intent
+  - tool_calling
+  - workflow
+  - safety
+
+output: outputs/results/eval_report.json
+
+targets:
+  intent_f1: 0.95
+  workflow_accuracy: 0.90
+  tool_f1: 0.92
+  response_quality: 4.2
+  schema_validity: 0.98

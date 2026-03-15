@@ -1,0 +1,19 @@
+model:
+  name: Qwen/Qwen3-4B-Instruct-2507
+  max_seq_length: 2048
+  load_in_4bit: true
+  use_unsloth: true
+
+defaults:
+  bf16: true
+  gradient_checkpointing: true
+  gradient_checkpointing_kwargs:
+    use_reentrant: false
+  optim: adamw_8bit
+  report_to: [wandb]
+  save_strategy: steps
+  save_steps: 500
+  eval_strategy: steps
+  eval_steps: 500
+  logging_steps: 10
+  seed: 42

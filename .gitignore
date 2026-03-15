@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# uv lock file (large, regenerated from pyproject.toml)
+uv.lock
+
+# Data (large files)
+data/raw/*.csv
+data/raw/*.json
+data/sampled/
+data/annotated/
+data/formatted/
+data/datasets/
+data/gold/
+data/processed/
+!data/raw/sample_tickets.jsonl
+
+# Model outputs & training artifacts
+outputs/
+runs/
+adapters/
+models/
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+
+# HuggingFace cache
+.cache/
+*.arrow
+*.lock
+
+# Docker volumes
+monitoring/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment / secrets
+.env
+.env.local
+*.key
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+wandb/
+mlruns/

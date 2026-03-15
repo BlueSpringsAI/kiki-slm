@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./adapters:/adapters
+      - ./models:/models
+    command: >
+      --model Qwen/Qwen3-4B-Instruct-2507
+      --enable-lora --max-loras 4 --max-lora-rank 64 --max-cpu-loras 8
+      --lora-modules
+        intent-classifier=/adapters/intent/
+        workflow-reasoner=/adapters/workflow/
+        tool-caller=/adapters/tools/
+        response-gen=/adapters/response/
+      --enable-prefix-caching
+      --quantization awq
+      --gpu-memory-utilization 0.90
+      --max-model-len 8192
+      --enable-chunked-prefill
+      --port 8000
+      --api-key kiki-internal
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./monitoring/dashboards:/var/lib/grafana/dashboards
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+    restart: unless-stopped

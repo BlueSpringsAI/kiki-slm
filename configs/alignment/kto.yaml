@@ -1,0 +1,22 @@
+inherits: base.yaml
+task: dpo_alignment
+output_dir: runs/kto-v1
+base_model_or_adapter: runs/grpo-v1/checkpoint-final
+
+alignment:
+  method: kto
+  learning_rate: 1.0e-6
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  num_train_epochs: 1
+  max_length: 1536
+  max_prompt_length: 768
+
+lora:
+  r: 16
+  lora_alpha: 16
+  target_modules: all-linear
+
+datasets:
+  - id: kiki_kto_data
+    path: data/processed/kto_binary.jsonl

@@ -1,0 +1,66 @@
+# Kiki SLM POC Configuration
+# All hyperparameters for the 2-day experiment
+
+project:
+  name: kiki-slm-poc
+  version: "0.1.0"
+
+data:
+  raw_dir: data/raw
+  sample_size: 5000
+  gold_test_size: 100
+  train_split: 0.9
+
+annotation:
+  model: gpt-4o-mini
+  max_concurrent: 20
+  batch_size: 50
+  temperature: 0.0
+  max_retries: 3
+
+model:
+  name: Qwen/Qwen3-4B-Instruct-2507
+  max_seq_length: 2048
+  load_in_4bit: true
+
+lora:
+  r: 32
+  lora_alpha: 64
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  lora_dropout: 0
+  bias: none
+
+training:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 8
+  num_train_epochs: 3
+  learning_rate: 2.0e-4
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03
+  bf16: true
+  optim: adamw_8bit
+  packing: true
+  gradient_checkpointing: true
+  save_steps: 200
+  eval_steps: 200
+  seed: 42
+
+evaluation:
+  judge_model: gpt-4o
+  comparison_models:
+    - model: gpt-4o
+      provider: openai
+    - model: claude-sonnet-4-20250514
+      provider: anthropic
+
+export:
+  format: gguf
+  quantization: q4_k_m
+  output_dir: outputs/exports

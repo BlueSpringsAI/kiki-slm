@@ -1,0 +1,39 @@
+inherits: base.yaml
+task: grpo_alignment
+output_dir: runs/grpo-v1
+base_model_or_adapter: runs/dpo-v1/checkpoint-final
+
+alignment:
+  method: grpo
+  learning_rate: 1.0e-6
+  per_device_train_batch_size: 4
+  num_train_epochs: 1
+  use_vllm: true
+  vllm_mode: colocate
+  num_generations: 8
+  max_completion_length: 512
+  max_prompt_length: 1024
+  kl_coef: 0.001
+
+lora:
+  r: 16
+  lora_alpha: 16
+  target_modules: all-linear
+
+rewards:
+  policy_compliance:
+    weight: 0.35
+    module: kiki.rewards.policy_compliance
+  tool_accuracy:
+    weight: 0.25
+    module: kiki.rewards.tool_accuracy
+  response_quality:
+    weight: 0.25
+    module: kiki.rewards.response_quality
+  format_validity:
+    weight: 0.15
+    module: kiki.rewards.format_validity
+
+datasets:
+  - id: kiki_grpo_prompts
+    path: data/processed/grpo_prompts.jsonl

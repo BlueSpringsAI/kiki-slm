@@ -1,0 +1,18 @@
+model: Qwen/Qwen3-4B-Instruct-2507
+quantization: awq
+enable_prefix_caching: true
+enable_lora: true
+max_loras: 4
+max_lora_rank: 64
+max_cpu_loras: 8
+gpu_memory_utilization: 0.90
+max_model_len: 8192
+enable_chunked_prefill: true
+port: 8000
+api_key: kiki-internal
+
+lora_modules:
+  intent-classifier: ./adapters/intent/
+  workflow-reasoner: ./adapters/workflow/
+  tool-caller: ./adapters/tools/
+  response-gen: ./adapters/response/
