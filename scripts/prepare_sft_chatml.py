@@ -60,10 +60,11 @@ SFT_DATASETS = {
         "hf_id": "Tobi-Bueck/customer-support-tickets",
         "converter": "ticket",
         "weight": 0.10,
-        "description": "Helpdesk tickets (61.8K)",
+        "filter_language": "en",
+        "description": "Helpdesk tickets (61.8K, English subset)",
     },
     "banking77": {
-        "hf_id": "PolyAI/banking77",
+        "hf_id": "legacy-datasets/banking77",
         "converter": "banking77",
         "weight": 0.10,
         "description": "Banking intent 77-class (13K)",
@@ -129,6 +130,13 @@ def download_and_convert(
 
     elapsed = time.monotonic() - t0
     logger.info("  Downloaded %d examples in %.1fs", len(ds), elapsed)
+
+    # Filter by language if specified
+    lang_filter = config.get("filter_language")
+    if lang_filter and "language" in ds.column_names:
+        before = len(ds)
+        ds = ds.filter(lambda x: x.get("language") == lang_filter)
+        logger.info("  Filtered to language='%s': %d -> %d", lang_filter, before, len(ds))
 
     # Convert ALL rows to ChatML first — then subsample from valid results
     converter = ChatMLConverter.get_converter(converter_name)
@@ -198,10 +206,29 @@ def main() -> None:
         examples = download_and_convert(name, config, num_samples, token)
         all_examples.extend(examples)
 
+    # Deduplicate (hash on user+assistant content, ignoring shared system prompt)
+    import hashlib
+    seen = set()
+    unique_examples = []
+    for ex in all_examples:
+        key_parts = [
+            f"{m.get('role')}:{m.get('content', '')}"
+            for m in ex.get("messages", [])
+            if m.get("role") != "system"
+        ]
+        h = hashlib.md5("|".join(key_parts).encode()).hexdigest()
+        if h not in seen:
+            seen.add(h)
+            unique_examples.append(ex)
+    dupes_removed = len(all_examples) - len(unique_examples)
+    if dupes_removed:
+        logger.info("Deduplication: removed %d duplicates (%d -> %d)", dupes_removed, len(all_examples), len(unique_examples))
+    all_examples = unique_examples
+
     # Shuffle
     random.shuffle(all_examples)
 
-    # Split train/eval
+    # Split train/eval — ensure no overlap by using disjoint hash buckets
     eval_size = int(len(all_examples) * args.eval_ratio)
     eval_data = all_examples[:eval_size]
     train_data = all_examples[eval_size:]

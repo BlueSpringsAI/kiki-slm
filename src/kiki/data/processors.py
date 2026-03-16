@@ -70,7 +70,7 @@ class ChatMLConverter:
     def from_ticket(example: dict) -> dict:
         """Customer-support-tickets dataset with department/priority metadata."""
         user_text = example.get("customer_message", example.get("body", ""))
-        assistant_text = example.get("agent_response", example.get("response", ""))
+        assistant_text = example.get("agent_response", example.get("response", example.get("answer", "")))
 
         system = DEFAULT_SYSTEM_PROMPT
         meta_parts = []

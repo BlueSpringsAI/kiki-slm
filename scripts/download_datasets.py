@@ -46,7 +46,7 @@ DATASET_REGISTRY: dict[str, dict] = {
         "description": "Helpdesk tickets with priority/queue/tags (61.8K)",
     },
     "banking77": {
-        "id": "PolyAI/banking77",
+        "id": "legacy-datasets/banking77",
         "description": "Fine-grained banking intent classification (13K, 77 classes)",
     },
     "clinc_oos": {
