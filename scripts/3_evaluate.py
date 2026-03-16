@@ -138,6 +138,10 @@ def load_gold_data(gold_file: str) -> list[dict]:
 
 def parse_model_json(raw_text: str) -> dict | None:
     text = raw_text.strip()
+    # Strip Qwen3 <think>...</think> reasoning tokens
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # Strip markdown code fences
     if text.startswith("```"):
         lines = text.split("\n")
         lines = [l for l in lines if not l.strip().startswith("```")]

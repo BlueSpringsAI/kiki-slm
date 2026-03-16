@@ -198,26 +198,84 @@ class ChatMLConverter:
 
         return {"messages": messages}
 
+    # Banking77 label names from the ClassLabel feature
+    _BANKING77_LABELS = [
+        "activate_my_card", "age_limit", "apple_pay_or_google_pay", "atm_support",
+        "automatic_top_up", "balance_not_updated_after_bank_transfer",
+        "balance_not_updated_after_cheque_or_cash_deposit", "beneficiary_not_allowed",
+        "cancel_transfer", "card_about_to_expire", "card_acceptance", "card_arrival",
+        "card_delivery_estimate", "card_linking", "card_not_working",
+        "card_payment_fee_charged", "card_payment_not_recognised",
+        "card_payment_wrong_exchange_rate", "card_swallowed", "cash_withdrawal_charge",
+        "cash_withdrawal_not_recognised", "change_pin", "compromised_card",
+        "contactless_not_working", "country_support", "declined_card_payment",
+        "declined_cash_withdrawal", "declined_transfer",
+        "direct_debit_payment_not_recognised", "disposable_card_limits",
+        "edit_personal_details", "exchange_charge", "exchange_rate", "exchange_via_app",
+        "extra_charge_on_statement", "failed_transfer", "fiat_currency_support",
+        "get_disposable_virtual_card", "get_physical_card", "getting_spare_card",
+        "getting_virtual_card", "lost_or_stolen_card", "lost_or_stolen_phone",
+        "order_physical_card", "passcode_forgotten", "pending_card_payment",
+        "pending_cash_withdrawal", "pending_top_up", "pending_transfer", "pin_blocked",
+        "receiving_money", "refund_not_showing_up", "request_refund",
+        "reverted_card_payment", "supported_cards_and_currencies", "terminate_account",
+        "top_up_by_bank_transfer_charge", "top_up_by_card_charge",
+        "top_up_by_cash_or_cheque", "top_up_failed", "top_up_limits", "top_up_reverted",
+        "topping_up_by_card", "transaction_charged_twice", "transfer_fee_charged",
+        "transfer_into_account", "transfer_not_received_by_recipient", "transfer_timing",
+        "unable_to_verify_identity", "verify_my_identity", "verify_source_of_funds",
+        "verify_top_up", "virtual_card_not_working", "visa_or_mastercard",
+        "why_verify_identity", "wrong_amount_of_cash_received",
+        "wrong_exchange_rate_for_cash_withdrawal",
+    ]
+
+    # Map banking77 intents to Kiki urgency/workflow/tools
+    _BANKING77_URGENCY = {
+        "compromised_card": "critical", "lost_or_stolen_card": "critical",
+        "lost_or_stolen_phone": "critical", "pin_blocked": "high",
+        "card_not_working": "high", "declined_card_payment": "high",
+        "failed_transfer": "high", "transaction_charged_twice": "high",
+        "card_swallowed": "high",
+    }
+
     @staticmethod
     def from_banking77(example: dict) -> dict:
-        """Convert Banking77 to intent classification format."""
+        """Convert Banking77 to intent classification with real labels and responses."""
         text = example.get("text", example.get("customer_message", ""))
         label = example.get("label", "")
 
-        # Banking77 uses integer labels; map to string if available
-        if isinstance(label, int):
-            label_str = f"banking_intent_{label}"
+        # Resolve integer label to real name
+        if isinstance(label, int) and 0 <= label < len(ChatMLConverter._BANKING77_LABELS):
+            intent = ChatMLConverter._BANKING77_LABELS[label]
         else:
-            label_str = str(label)
+            intent = str(label).lower().replace(" ", "_")
+
+        # Map to Kiki intent categories
+        kiki_intent = "account_management"
+        if any(kw in intent for kw in ("refund", "charge", "fee", "exchange")):
+            kiki_intent = "billing_inquiry"
+        elif any(kw in intent for kw in ("card", "pin", "contactless", "visa", "mastercard")):
+            kiki_intent = "account_management"
+        elif any(kw in intent for kw in ("transfer", "top_up", "receiving", "balance")):
+            kiki_intent = "payment_issue"
+        elif any(kw in intent for kw in ("lost", "stolen", "compromised")):
+            kiki_intent = "fraud_report"
+        elif any(kw in intent for kw in ("verify", "identity")):
+            kiki_intent = "account_management"
+        elif any(kw in intent for kw in ("terminate", "cancel")):
+            kiki_intent = "cancellation"
+
+        urgency = ChatMLConverter._BANKING77_URGENCY.get(intent, "medium")
+        human_intent = intent.replace("_", " ")
 
         assistant_output = json.dumps(
             {
-                "intent": label_str,
-                "urgency": "medium",
-                "workflow_steps": ["classify_intent", "route_to_department"],
-                "tools_required": [],
-                "reasoning": f"Customer intent classified as {label_str}.",
-                "response": "Thank you for reaching out. Let me help you with that.",
+                "intent": kiki_intent,
+                "urgency": urgency,
+                "workflow_steps": ["verify_identity", f"investigate_{intent}", "resolve_issue", "notify_customer"],
+                "tools_required": ["customer_profile_api", "payment_gateway_api"],
+                "reasoning": f"Customer is asking about {human_intent}. This is a {kiki_intent} case with {urgency} urgency.",
+                "response": f"I understand you're experiencing an issue with {human_intent}. Let me look into this for you right away. I'll pull up your account details and work on resolving this as quickly as possible.",
             },
             indent=2,
         )
@@ -230,44 +288,105 @@ class ChatMLConverter:
             ]
         }
 
+    # CLINC intent names from ClassLabel
+    _CLINC_LABELS = [
+        "restaurant_reviews", "nutrition_info", "account_blocked", "oil_change_how",
+        "time", "weather", "redeem_rewards", "interest_rate", "gas_type",
+        "accept_reservations", "smart_home", "user_name", "report_lost_card",
+        "repeat", "whisper_mode", "what_are_your_hobbies", "order", "jump_start",
+        "schedule_meeting", "meeting_schedule", "freeze_account", "what_song",
+        "meaning_of_life", "restaurant_reservation", "traffic", "make_call", "text",
+        "bill_balance", "improve_credit_score", "change_language", "no",
+        "measurement_conversion", "timer", "flip_coin", "do_you_have_pets", "balance",
+        "tell_joke", "last_maintenance", "exchange_rate", "uber", "car_rental",
+        "credit_limit", "oos", "shopping_list", "expiration_date", "routing",
+        "meal_suggestion", "tire_change", "todo_list", "card_declined",
+        "rewards_balance", "change_accent", "vaccines", "reminder_update", "food_last",
+        "change_ai_name", "bill_due", "who_do_you_work_for", "share_location",
+        "international_visa", "calendar", "translate", "carry_on", "book_flight",
+        "insurance_change", "todo_list_update", "timezone", "cancel_reservation",
+        "transactions", "credit_score", "report_fraud", "spending_history", "directions",
+        "spelling", "insurance", "what_is_your_name", "reminder", "where_are_you_from",
+        "distance", "payday", "flight_status", "find_phone", "greeting", "alarm",
+        "order_status", "confirm_reservation", "cook_time", "damaged_card",
+        "reset_settings", "pin_change", "replacement_card_duration", "new_card",
+        "roll_dice", "income", "taxes", "date", "who_made_you", "pto_request",
+        "tire_pressure", "how_old_are_you", "rollover_401k", "pto_request_status",
+        "how_busy", "application_status", "recipe", "calendar_update", "play_music",
+        "yes", "direct_deposit", "credit_limit_change", "gas", "pay_bill",
+        "ingredients_list", "lost_luggage", "goodbye", "what_can_i_ask_you",
+        "book_hotel", "are_you_a_bot", "next_song", "change_speed", "plug_type",
+        "maybe", "w2", "oil_change_when", "thank_you", "shopping_list_update",
+        "pto_balance", "order_checks", "travel_alert", "fun_fact", "sync_device",
+        "schedule_maintenance", "apr", "transfer", "ingredient_substitution",
+        "calories", "current_location", "international_fees", "calculator",
+        "definition", "next_holiday", "update_playlist", "mpg", "min_payment",
+        "change_user_name", "restaurant_suggestion", "travel_notification", "cancel",
+        "pto_used", "travel_suggestion", "change_volume",
+    ]
+
+    # Map CLINC intents to Kiki categories
+    _CLINC_TO_KIKI = {
+        "order_status": "order_status", "order": "order_status",
+        "bill_balance": "billing_inquiry", "bill_due": "billing_inquiry",
+        "pay_bill": "billing_inquiry", "min_payment": "billing_inquiry",
+        "transactions": "billing_inquiry", "spending_history": "billing_inquiry",
+        "report_fraud": "fraud_report", "report_lost_card": "fraud_report",
+        "freeze_account": "fraud_report",
+        "account_blocked": "account_management", "pin_change": "account_management",
+        "reset_settings": "account_management", "change_user_name": "account_management",
+        "cancel": "cancellation", "cancel_reservation": "cancellation",
+        "damaged_card": "return_request", "new_card": "product_inquiry",
+        "replacement_card_duration": "shipping_issue",
+        "card_declined": "payment_issue", "transfer": "payment_issue",
+        "balance": "billing_inquiry", "credit_score": "billing_inquiry",
+        "credit_limit": "billing_inquiry", "credit_limit_change": "billing_inquiry",
+        "interest_rate": "billing_inquiry", "apr": "billing_inquiry",
+        "direct_deposit": "payment_issue", "redeem_rewards": "billing_inquiry",
+        "rewards_balance": "billing_inquiry",
+        "insurance": "product_inquiry", "insurance_change": "product_inquiry",
+        "international_fees": "billing_inquiry", "exchange_rate": "billing_inquiry",
+    }
+
     @staticmethod
     def from_clinc(example: dict) -> dict:
-        """Convert CLINC OOS to intent classification with out-of-scope handling."""
+        """Convert CLINC OOS to intent classification with real labels and responses."""
         text = example.get("text", "")
-        intent = example.get("intent", example.get("label", ""))
+        intent_raw = example.get("intent", example.get("label", ""))
 
-        # CLINC uses integer labels; 42 = oos in the plus split
-        if isinstance(intent, int):
-            if intent == 42:
-                intent_str = "out_of_scope"
-            else:
-                intent_str = f"clinc_intent_{intent}"
+        # Resolve integer label to real name
+        if isinstance(intent_raw, int) and 0 <= intent_raw < len(ChatMLConverter._CLINC_LABELS):
+            intent = ChatMLConverter._CLINC_LABELS[intent_raw]
         else:
-            intent_str = str(intent)
+            intent = str(intent_raw).lower().replace(" ", "_")
 
-        is_oos = intent_str == "out_of_scope" or intent_str == "oos"
+        is_oos = intent == "oos"
 
         if is_oos:
             assistant_output = json.dumps(
                 {
                     "intent": "general_inquiry",
                     "urgency": "low",
-                    "workflow_steps": ["escalate_to_supervisor"],
-                    "tools_required": [],
-                    "reasoning": "This request is outside my area of expertise. Escalating to a human agent.",
-                    "response": "I'm not sure I can help with that specific request. Let me connect you with a specialist who can assist you better.",
+                    "workflow_steps": ["assess_request", "escalate_to_supervisor"],
+                    "tools_required": ["ticket_update_api"],
+                    "reasoning": "This request is outside the standard service categories. Escalating to a human agent for proper handling.",
+                    "response": "I appreciate you reaching out. This particular request falls outside my area of expertise, so let me connect you with a specialist who can assist you properly. I'll make sure your case is prioritized.",
                 },
                 indent=2,
             )
         else:
+            # Map to Kiki intent or use general_inquiry
+            kiki_intent = ChatMLConverter._CLINC_TO_KIKI.get(intent, "general_inquiry")
+            human_intent = intent.replace("_", " ")
+
             assistant_output = json.dumps(
                 {
-                    "intent": intent_str,
+                    "intent": kiki_intent,
                     "urgency": "medium",
-                    "workflow_steps": ["classify_intent", "route_to_department"],
-                    "tools_required": [],
-                    "reasoning": f"Customer intent classified as {intent_str}.",
-                    "response": "Thank you for reaching out. Let me help you with that.",
+                    "workflow_steps": ["verify_identity", f"handle_{intent}", "resolve_issue", "notify_customer"],
+                    "tools_required": ["customer_profile_api"],
+                    "reasoning": f"Customer is asking about {human_intent}. Classified as {kiki_intent}.",
+                    "response": f"I'd be happy to help you with {human_intent}. Let me pull up your account information and get this sorted out for you right away.",
                 },
                 indent=2,
             )
