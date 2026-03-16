@@ -53,37 +53,140 @@ def _msg(role: str, content: str) -> dict[str, str]:
 class ChatMLConverter:
     """Static methods to convert various dataset formats to ChatML messages."""
 
+    # Bitext category -> Kiki intent mapping
+    _BITEXT_CATEGORY_TO_KIKI = {
+        "ORDER": "order_status",
+        "REFUND": "refund_request",
+        "INVOICE": "billing_inquiry",
+        "FEEDBACK": "complaint",
+        "SHIPPING": "shipping_issue",
+        "DELIVERY": "shipping_issue",
+        "CANCEL": "cancellation",
+        "ACCOUNT": "account_management",
+        "PAYMENT": "payment_issue",
+        "CONTACT": "general_inquiry",
+        "SUBSCRIPTION": "billing_inquiry",
+    }
+
+    _BITEXT_CATEGORY_URGENCY = {
+        "ORDER": "medium", "REFUND": "high", "INVOICE": "low",
+        "FEEDBACK": "low", "SHIPPING": "medium", "DELIVERY": "medium",
+        "CANCEL": "medium", "ACCOUNT": "medium", "PAYMENT": "high",
+        "CONTACT": "low", "SUBSCRIPTION": "low",
+    }
+
+    _BITEXT_INTENT_TOOLS = {
+        "order_status": ["order_lookup_api", "shipment_tracking_api"],
+        "refund_request": ["order_lookup_api", "refund_processing_api"],
+        "billing_inquiry": ["payment_gateway_api", "invoice_verification_api"],
+        "complaint": ["ticket_update_api", "customer_profile_api"],
+        "shipping_issue": ["shipment_tracking_api", "order_lookup_api"],
+        "cancellation": ["order_lookup_api", "customer_profile_api"],
+        "account_management": ["customer_profile_api"],
+        "payment_issue": ["payment_gateway_api", "customer_profile_api"],
+        "general_inquiry": ["ticket_update_api"],
+    }
+
+    _BITEXT_INTENT_STEPS = {
+        "order_status": ["check_order", "track_shipment", "provide_update", "notify_customer"],
+        "refund_request": ["verify_order", "check_refund_eligibility", "process_refund", "send_confirmation"],
+        "billing_inquiry": ["verify_identity", "check_billing_records", "resolve_discrepancy", "notify_customer"],
+        "complaint": ["acknowledge_issue", "investigate_complaint", "propose_resolution", "follow_up"],
+        "shipping_issue": ["check_shipment_status", "investigate_delay", "update_customer", "arrange_reshipment"],
+        "cancellation": ["verify_order", "check_cancellation_policy", "process_cancellation", "confirm_refund"],
+        "account_management": ["verify_identity", "update_account", "confirm_changes", "notify_customer"],
+        "payment_issue": ["verify_identity", "check_payment_status", "resolve_payment", "confirm_resolution"],
+        "general_inquiry": ["assess_request", "provide_information", "offer_assistance"],
+    }
+
     @staticmethod
     def from_bitext(example: dict) -> dict:
-        """Bitext customer-support datasets: instruction + response, with intent/category."""
+        """Bitext customer-support datasets: map category to Kiki intent, output structured JSON."""
         user_text = example.get("instruction", example.get("customer_message", ""))
-        assistant_text = example.get("response", example.get("agent_response", ""))
-        intent = example.get("intent", example.get("category", ""))
+        response_text = example.get("response", example.get("agent_response", ""))
+        category = example.get("category", "").upper()
+        original_intent = example.get("intent", "")
 
-        system = DEFAULT_SYSTEM_PROMPT
-        if intent:
-            system += f"\n\nThis ticket has been classified as: {intent}"
+        kiki_intent = ChatMLConverter._BITEXT_CATEGORY_TO_KIKI.get(category, "general_inquiry")
+        urgency = ChatMLConverter._BITEXT_CATEGORY_URGENCY.get(category, "medium")
+        tools = ChatMLConverter._BITEXT_INTENT_TOOLS.get(kiki_intent, ["ticket_update_api"])
+        steps = ChatMLConverter._BITEXT_INTENT_STEPS.get(kiki_intent, ["assess_request", "resolve_issue"])
 
-        return {"messages": [_msg("system", system), _msg("user", user_text), _msg("assistant", assistant_text)]}
+        assistant_output = json.dumps(
+            {
+                "intent": kiki_intent,
+                "urgency": urgency,
+                "workflow_steps": steps,
+                "tools_required": tools,
+                "reasoning": f"Customer request categorized as {kiki_intent} ({original_intent}). Urgency: {urgency}.",
+                "response": response_text,
+            },
+            indent=2,
+        )
+
+        return {"messages": [_msg("system", DEFAULT_SYSTEM_PROMPT), _msg("user", user_text), _msg("assistant", assistant_output)]}
+
+    # Customer support tickets: queue -> Kiki intent
+    _TICKET_QUEUE_TO_KIKI = {
+        "Technical Support": "technical_support",
+        "IT Support": "technical_support",
+        "Billing and Payments": "billing_inquiry",
+        "Returns and Exchanges": "return_request",
+        "Product Support": "product_inquiry",
+        "Customer Service": "general_inquiry",
+        "Service Outages and Maintenance": "complaint",
+        "Sales and Pre-Sales": "product_inquiry",
+        "General Inquiry": "general_inquiry",
+        "Human Resources": "general_inquiry",
+    }
+
+    _TICKET_PRIORITY_TO_URGENCY = {"high": "high", "medium": "medium", "low": "low"}
+
+    _TICKET_INTENT_TOOLS = {
+        "technical_support": ["ticket_update_api", "customer_profile_api"],
+        "billing_inquiry": ["payment_gateway_api", "invoice_verification_api"],
+        "return_request": ["order_lookup_api", "refund_processing_api"],
+        "product_inquiry": ["customer_profile_api", "policy_engine"],
+        "general_inquiry": ["ticket_update_api"],
+        "complaint": ["ticket_update_api", "customer_profile_api"],
+    }
+
+    _TICKET_INTENT_STEPS = {
+        "technical_support": ["diagnose_issue", "check_system_status", "apply_fix", "verify_resolution", "notify_customer"],
+        "billing_inquiry": ["verify_identity", "check_billing_records", "resolve_discrepancy", "notify_customer"],
+        "return_request": ["verify_order", "check_return_policy", "process_return", "arrange_pickup", "confirm_refund"],
+        "product_inquiry": ["identify_product", "provide_information", "offer_alternatives"],
+        "general_inquiry": ["assess_request", "provide_information", "offer_assistance"],
+        "complaint": ["acknowledge_issue", "investigate_root_cause", "escalate_if_needed", "propose_resolution"],
+    }
 
     @staticmethod
     def from_ticket(example: dict) -> dict:
-        """Customer-support-tickets dataset with department/priority metadata."""
+        """Customer-support-tickets: map queue to Kiki intent, output structured JSON."""
         user_text = example.get("customer_message", example.get("body", ""))
-        assistant_text = example.get("agent_response", example.get("response", example.get("answer", "")))
+        response_text = example.get("agent_response", example.get("response", example.get("answer", "")))
+        queue = example.get("queue", "Customer Service")
+        priority = example.get("priority", "medium")
+        ticket_type = example.get("type", "")
 
-        system = DEFAULT_SYSTEM_PROMPT
-        meta_parts = []
-        if example.get("department"):
-            meta_parts.append(f"Department: {example['department']}")
-        if example.get("priority"):
-            meta_parts.append(f"Priority: {example['priority']}")
-        if example.get("ticket_type"):
-            meta_parts.append(f"Type: {example['ticket_type']}")
-        if meta_parts:
-            system += "\n\nTicket metadata:\n" + "\n".join(meta_parts)
+        kiki_intent = ChatMLConverter._TICKET_QUEUE_TO_KIKI.get(queue, "general_inquiry")
+        urgency = ChatMLConverter._TICKET_PRIORITY_TO_URGENCY.get(priority, "medium")
+        tools = ChatMLConverter._TICKET_INTENT_TOOLS.get(kiki_intent, ["ticket_update_api"])
+        steps = ChatMLConverter._TICKET_INTENT_STEPS.get(kiki_intent, ["assess_request", "resolve_issue"])
 
-        return {"messages": [_msg("system", system), _msg("user", user_text), _msg("assistant", assistant_text)]}
+        assistant_output = json.dumps(
+            {
+                "intent": kiki_intent,
+                "urgency": urgency,
+                "workflow_steps": steps,
+                "tools_required": tools,
+                "reasoning": f"Ticket routed to {queue} queue with {priority} priority. Type: {ticket_type}. Classified as {kiki_intent}.",
+                "response": response_text,
+            },
+            indent=2,
+        )
+
+        return {"messages": [_msg("system", DEFAULT_SYSTEM_PROMPT), _msg("user", user_text), _msg("assistant", assistant_output)]}
 
     @staticmethod
     def from_glaive_function_calling(example: dict) -> dict:
@@ -229,64 +332,103 @@ class ChatMLConverter:
         "wrong_exchange_rate_for_cash_withdrawal",
     ]
 
-    # Map banking77 intents to Kiki urgency/workflow/tools
+    # Precise banking77 label -> Kiki intent mapping (every label explicitly mapped)
+    _BANKING77_TO_KIKI = {
+        # payment_issue — card failures, declined, pending, failed
+        "card_not_working": "payment_issue", "declined_card_payment": "payment_issue",
+        "declined_cash_withdrawal": "payment_issue", "declined_transfer": "payment_issue",
+        "failed_transfer": "payment_issue", "pending_card_payment": "payment_issue",
+        "pending_cash_withdrawal": "payment_issue", "pending_top_up": "payment_issue",
+        "pending_transfer": "payment_issue", "contactless_not_working": "payment_issue",
+        "card_swallowed": "payment_issue", "virtual_card_not_working": "payment_issue",
+        "top_up_failed": "payment_issue",
+        # billing_inquiry — charges, fees, exchange rates, statements
+        "card_payment_fee_charged": "billing_inquiry", "cash_withdrawal_charge": "billing_inquiry",
+        "exchange_charge": "billing_inquiry", "exchange_rate": "billing_inquiry",
+        "card_payment_wrong_exchange_rate": "billing_inquiry",
+        "extra_charge_on_statement": "billing_inquiry", "top_up_by_bank_transfer_charge": "billing_inquiry",
+        "top_up_by_card_charge": "billing_inquiry", "transfer_fee_charged": "billing_inquiry",
+        "transaction_charged_twice": "billing_inquiry",
+        "wrong_exchange_rate_for_cash_withdrawal": "billing_inquiry",
+        "direct_debit_payment_not_recognised": "billing_inquiry",
+        "card_payment_not_recognised": "billing_inquiry",
+        "cash_withdrawal_not_recognised": "billing_inquiry",
+        "wrong_amount_of_cash_received": "billing_inquiry",
+        # refund_request
+        "request_refund": "refund_request", "refund_not_showing_up": "refund_request",
+        "reverted_card_payment": "refund_request", "top_up_reverted": "refund_request",
+        # fraud_report — lost, stolen, compromised
+        "lost_or_stolen_card": "fraud_report", "lost_or_stolen_phone": "fraud_report",
+        "compromised_card": "fraud_report",
+        # account_management — PIN, personal details, verify, activate
+        "activate_my_card": "account_management", "change_pin": "account_management",
+        "pin_blocked": "account_management", "edit_personal_details": "account_management",
+        "passcode_forgotten": "account_management",
+        "unable_to_verify_identity": "account_management", "verify_my_identity": "account_management",
+        "verify_source_of_funds": "account_management", "why_verify_identity": "account_management",
+        "card_linking": "account_management", "verify_top_up": "account_management",
+        # cancellation
+        "cancel_transfer": "cancellation", "terminate_account": "cancellation",
+        # product_inquiry — getting cards, supported features, info
+        "get_physical_card": "product_inquiry", "get_disposable_virtual_card": "product_inquiry",
+        "getting_virtual_card": "product_inquiry", "getting_spare_card": "product_inquiry",
+        "order_physical_card": "product_inquiry", "supported_cards_and_currencies": "product_inquiry",
+        "fiat_currency_support": "product_inquiry", "country_support": "product_inquiry",
+        "apple_pay_or_google_pay": "product_inquiry", "visa_or_mastercard": "product_inquiry",
+        "card_acceptance": "product_inquiry", "age_limit": "product_inquiry",
+        "exchange_via_app": "product_inquiry", "disposable_card_limits": "product_inquiry",
+        "top_up_limits": "product_inquiry", "automatic_top_up": "product_inquiry",
+        "top_up_by_cash_or_cheque": "product_inquiry", "topping_up_by_card": "product_inquiry",
+        # shipping_issue — delivery, arrival
+        "card_arrival": "shipping_issue", "card_delivery_estimate": "shipping_issue",
+        "card_about_to_expire": "shipping_issue",
+        # order_status — balance, transfer status
+        "balance_not_updated_after_bank_transfer": "order_status",
+        "balance_not_updated_after_cheque_or_cash_deposit": "order_status",
+        "transfer_not_received_by_recipient": "order_status", "transfer_timing": "order_status",
+        "receiving_money": "order_status", "transfer_into_account": "order_status",
+        "beneficiary_not_allowed": "order_status",
+    }
+
     _BANKING77_URGENCY = {
         "compromised_card": "critical", "lost_or_stolen_card": "critical",
         "lost_or_stolen_phone": "critical", "pin_blocked": "high",
         "card_not_working": "high", "declined_card_payment": "high",
         "failed_transfer": "high", "transaction_charged_twice": "high",
-        "card_swallowed": "high",
+        "card_swallowed": "high", "pending_transfer": "medium",
     }
 
     @staticmethod
     def from_banking77(example: dict) -> dict:
-        """Convert Banking77 to intent classification with real labels and responses."""
+        """Convert Banking77 with precise per-label Kiki intent mapping."""
         text = example.get("text", example.get("customer_message", ""))
         label = example.get("label", "")
 
-        # Resolve integer label to real name
         if isinstance(label, int) and 0 <= label < len(ChatMLConverter._BANKING77_LABELS):
             intent = ChatMLConverter._BANKING77_LABELS[label]
         else:
             intent = str(label).lower().replace(" ", "_")
 
-        # Map to Kiki intent categories
-        kiki_intent = "account_management"
-        if any(kw in intent for kw in ("refund", "charge", "fee", "exchange")):
-            kiki_intent = "billing_inquiry"
-        elif any(kw in intent for kw in ("card", "pin", "contactless", "visa", "mastercard")):
-            kiki_intent = "account_management"
-        elif any(kw in intent for kw in ("transfer", "top_up", "receiving", "balance")):
-            kiki_intent = "payment_issue"
-        elif any(kw in intent for kw in ("lost", "stolen", "compromised")):
-            kiki_intent = "fraud_report"
-        elif any(kw in intent for kw in ("verify", "identity")):
-            kiki_intent = "account_management"
-        elif any(kw in intent for kw in ("terminate", "cancel")):
-            kiki_intent = "cancellation"
-
+        kiki_intent = ChatMLConverter._BANKING77_TO_KIKI.get(intent, "general_inquiry")
         urgency = ChatMLConverter._BANKING77_URGENCY.get(intent, "medium")
         human_intent = intent.replace("_", " ")
+
+        tools = ChatMLConverter._BITEXT_INTENT_TOOLS.get(kiki_intent, ["customer_profile_api"])
+        steps = ChatMLConverter._BITEXT_INTENT_STEPS.get(kiki_intent, ["verify_identity", "resolve_issue"])
 
         assistant_output = json.dumps(
             {
                 "intent": kiki_intent,
                 "urgency": urgency,
-                "workflow_steps": ["verify_identity", f"investigate_{intent}", "resolve_issue", "notify_customer"],
-                "tools_required": ["customer_profile_api", "payment_gateway_api"],
-                "reasoning": f"Customer is asking about {human_intent}. This is a {kiki_intent} case with {urgency} urgency.",
-                "response": f"I understand you're experiencing an issue with {human_intent}. Let me look into this for you right away. I'll pull up your account details and work on resolving this as quickly as possible.",
+                "workflow_steps": steps,
+                "tools_required": tools,
+                "reasoning": f"Customer is asking about {human_intent}. Classified as {kiki_intent} with {urgency} urgency.",
+                "response": f"I understand you're experiencing an issue with {human_intent}. Let me look into this for you right away and get it resolved as quickly as possible.",
             },
             indent=2,
         )
 
-        return {
-            "messages": [
-                _msg("system", DEFAULT_SYSTEM_PROMPT),
-                _msg("user", text),
-                _msg("assistant", assistant_output),
-            ]
-        }
+        return {"messages": [_msg("system", DEFAULT_SYSTEM_PROMPT), _msg("user", text), _msg("assistant", assistant_output)]}
 
     # CLINC intent names from ClassLabel
     _CLINC_LABELS = [
@@ -325,79 +467,95 @@ class ChatMLConverter:
         "pto_used", "travel_suggestion", "change_volume",
     ]
 
-    # Map CLINC intents to Kiki categories
+    # CLINC intents -> Kiki intent (comprehensive mapping)
     _CLINC_TO_KIKI = {
-        "order_status": "order_status", "order": "order_status",
+        # order_status
+        "order_status": "order_status", "order": "order_status", "order_checks": "order_status",
+        "flight_status": "order_status", "application_status": "order_status",
+        # billing_inquiry
         "bill_balance": "billing_inquiry", "bill_due": "billing_inquiry",
         "pay_bill": "billing_inquiry", "min_payment": "billing_inquiry",
         "transactions": "billing_inquiry", "spending_history": "billing_inquiry",
-        "report_fraud": "fraud_report", "report_lost_card": "fraud_report",
-        "freeze_account": "fraud_report",
-        "account_blocked": "account_management", "pin_change": "account_management",
-        "reset_settings": "account_management", "change_user_name": "account_management",
-        "cancel": "cancellation", "cancel_reservation": "cancellation",
-        "damaged_card": "return_request", "new_card": "product_inquiry",
-        "replacement_card_duration": "shipping_issue",
-        "card_declined": "payment_issue", "transfer": "payment_issue",
         "balance": "billing_inquiry", "credit_score": "billing_inquiry",
         "credit_limit": "billing_inquiry", "credit_limit_change": "billing_inquiry",
         "interest_rate": "billing_inquiry", "apr": "billing_inquiry",
-        "direct_deposit": "payment_issue", "redeem_rewards": "billing_inquiry",
-        "rewards_balance": "billing_inquiry",
-        "insurance": "product_inquiry", "insurance_change": "product_inquiry",
         "international_fees": "billing_inquiry", "exchange_rate": "billing_inquiry",
+        "redeem_rewards": "billing_inquiry", "rewards_balance": "billing_inquiry",
+        "income": "billing_inquiry", "taxes": "billing_inquiry", "w2": "billing_inquiry",
+        "payday": "billing_inquiry", "rollover_401k": "billing_inquiry",
+        # payment_issue
+        "card_declined": "payment_issue", "transfer": "payment_issue",
+        "direct_deposit": "payment_issue",
+        # fraud_report
+        "report_fraud": "fraud_report", "report_lost_card": "fraud_report",
+        "freeze_account": "fraud_report",
+        # account_management
+        "account_blocked": "account_management", "pin_change": "account_management",
+        "reset_settings": "account_management", "change_user_name": "account_management",
+        "change_language": "account_management", "change_accent": "account_management",
+        "change_ai_name": "account_management", "change_speed": "account_management",
+        "change_volume": "account_management", "sync_device": "account_management",
+        "user_name": "account_management",
+        # cancellation
+        "cancel": "cancellation", "cancel_reservation": "cancellation",
+        # product_inquiry
+        "new_card": "product_inquiry", "insurance": "product_inquiry",
+        "insurance_change": "product_inquiry", "international_visa": "product_inquiry",
+        "plug_type": "product_inquiry", "carry_on": "product_inquiry",
+        "vaccines": "product_inquiry", "mpg": "product_inquiry",
+        # return_request
+        "damaged_card": "return_request", "lost_luggage": "return_request",
+        # shipping_issue
+        "replacement_card_duration": "shipping_issue",
+        # complaint — nothing direct, skip
+        # general_inquiry — everything else (greeting, weather, jokes, etc.)
+    }
+
+    _CLINC_URGENCY = {
+        "report_fraud": "critical", "report_lost_card": "critical",
+        "freeze_account": "critical", "account_blocked": "high",
+        "card_declined": "high",
     }
 
     @staticmethod
     def from_clinc(example: dict) -> dict:
-        """Convert CLINC OOS to intent classification with real labels and responses."""
+        """Convert CLINC OOS with comprehensive Kiki intent mapping."""
         text = example.get("text", "")
         intent_raw = example.get("intent", example.get("label", ""))
 
-        # Resolve integer label to real name
         if isinstance(intent_raw, int) and 0 <= intent_raw < len(ChatMLConverter._CLINC_LABELS):
             intent = ChatMLConverter._CLINC_LABELS[intent_raw]
         else:
             intent = str(intent_raw).lower().replace(" ", "_")
 
         is_oos = intent == "oos"
+        kiki_intent = "general_inquiry" if is_oos else ChatMLConverter._CLINC_TO_KIKI.get(intent, "general_inquiry")
+        urgency = ChatMLConverter._CLINC_URGENCY.get(intent, "low" if is_oos else "medium")
+        human_intent = intent.replace("_", " ")
+
+        tools = ChatMLConverter._BITEXT_INTENT_TOOLS.get(kiki_intent, ["ticket_update_api"])
+        steps = ChatMLConverter._BITEXT_INTENT_STEPS.get(kiki_intent, ["assess_request", "provide_information"])
 
         if is_oos:
-            assistant_output = json.dumps(
-                {
-                    "intent": "general_inquiry",
-                    "urgency": "low",
-                    "workflow_steps": ["assess_request", "escalate_to_supervisor"],
-                    "tools_required": ["ticket_update_api"],
-                    "reasoning": "This request is outside the standard service categories. Escalating to a human agent for proper handling.",
-                    "response": "I appreciate you reaching out. This particular request falls outside my area of expertise, so let me connect you with a specialist who can assist you properly. I'll make sure your case is prioritized.",
-                },
-                indent=2,
-            )
+            response = "I appreciate you reaching out. This falls outside my area of expertise, so let me connect you with a specialist who can assist you properly."
+            reasoning = "Request is outside standard service categories. Escalating to a human agent."
         else:
-            # Map to Kiki intent or use general_inquiry
-            kiki_intent = ChatMLConverter._CLINC_TO_KIKI.get(intent, "general_inquiry")
-            human_intent = intent.replace("_", " ")
+            response = f"I'd be happy to help you with {human_intent}. Let me pull up the relevant information and get this sorted out for you right away."
+            reasoning = f"Customer is asking about {human_intent}. Classified as {kiki_intent} with {urgency} urgency."
 
-            assistant_output = json.dumps(
-                {
-                    "intent": kiki_intent,
-                    "urgency": "medium",
-                    "workflow_steps": ["verify_identity", f"handle_{intent}", "resolve_issue", "notify_customer"],
-                    "tools_required": ["customer_profile_api"],
-                    "reasoning": f"Customer is asking about {human_intent}. Classified as {kiki_intent}.",
-                    "response": f"I'd be happy to help you with {human_intent}. Let me pull up your account information and get this sorted out for you right away.",
-                },
-                indent=2,
-            )
+        assistant_output = json.dumps(
+            {
+                "intent": kiki_intent,
+                "urgency": urgency,
+                "workflow_steps": steps,
+                "tools_required": tools,
+                "reasoning": reasoning,
+                "response": response,
+            },
+            indent=2,
+        )
 
-        return {
-            "messages": [
-                _msg("system", DEFAULT_SYSTEM_PROMPT),
-                _msg("user", text),
-                _msg("assistant", assistant_output),
-            ]
-        }
+        return {"messages": [_msg("system", DEFAULT_SYSTEM_PROMPT), _msg("user", text), _msg("assistant", assistant_output)]}
 
     @staticmethod
     def from_kiki_annotated(example: dict) -> dict:
