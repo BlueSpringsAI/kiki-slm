@@ -74,7 +74,7 @@ def auto_detect_gpu() -> dict:
         return {"gpu_name": "CPU", "gpu_mem_gb": 0, "batch_size": 1, "grad_accum": 4}
 
     gpu_name = torch.cuda.get_device_name(0)
-    gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
     if gpu_mem_gb >= 35:  # A100
         batch_size, grad_accum = 4, 8
