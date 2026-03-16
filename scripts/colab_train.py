@@ -58,6 +58,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", default="kiki-slm", help="W&B project name")
     parser.add_argument("--wandb-run-name", default=None, help="W&B run name (auto if not set)")
+    # Resume
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output-dir")
     # Misc
     parser.add_argument("--dry-run", action="store_true", help="Validate config and exit")
     return parser.parse_args()
@@ -326,10 +328,20 @@ def main():
         callbacks=[StepCountCallback()],
     )
 
-    # 10. Train
-    print(f"\n  GPU memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
+    # 10. Train (with optional resume from checkpoint)
+    resume_checkpoint = None
+    if args.resume:
+        import glob
+        checkpoints = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")))
+        if checkpoints:
+            resume_checkpoint = checkpoints[-1]
+            print(f"\n  Resuming from checkpoint: {resume_checkpoint}")
+        else:
+            print(f"\n  --resume passed but no checkpoints found in {args.output_dir}, starting fresh")
+
+    print(f"  GPU memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
     start_time = time.time()
-    result = trainer.train()
+    result = trainer.train(resume_from_checkpoint=resume_checkpoint)
     elapsed = time.time() - start_time
 
     final_loss = result.metrics.get("train_loss", 0)
