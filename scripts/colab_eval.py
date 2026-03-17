@@ -107,21 +107,39 @@ def run_inference(model, tokenizer, message: str) -> tuple[dict | None, str, flo
         tokenize=False,
         add_generation_prompt=True,
     )
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
+    input_ids = tokenizer(prompt, return_tensors="pt")["input_ids"].to(model.device)
+    input_len = input_ids.shape[1]
 
     start = time.perf_counter()
     with torch.no_grad():
-        # Use standard generate (not Unsloth's fast path which has shape bugs
-        # with transformers 5.3+ on certain GPU architectures)
-        generate_fn = getattr(model, "_old_generate", model.generate)
-        outputs = generate_fn(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
+        # TextStreamer-based generation avoids Unsloth's buggy fast inference
+        # path that crashes on transformers 5.3+ with shape mismatch errors
+        from transformers import TextStreamer
+
+        streamer = TextStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+        # Temporarily disable Unsloth's fast forward if possible
+        _patched = getattr(model, "is_unsloth_patched", False)
+        if _patched:
+            try:
+                model.is_unsloth_patched = False
+            except Exception:
+                pass
+
+        outputs = model.generate(
+            input_ids=input_ids,
             max_new_tokens=512,
             temperature=0.1,
             do_sample=True,
+            use_cache=False,  # Disable KV cache to avoid Unsloth fast path
         )
+
+        if _patched:
+            try:
+                model.is_unsloth_patched = True
+            except Exception:
+                pass
+
     latency = time.perf_counter() - start
 
     raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
