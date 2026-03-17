@@ -112,7 +112,16 @@ def run_inference(model, tokenizer, message: str) -> tuple[dict | None, str, flo
 
     start = time.perf_counter()
     with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=512, temperature=0.1, do_sample=True)
+        # Use standard generate (not Unsloth's fast path which has shape bugs
+        # with transformers 5.3+ on certain GPU architectures)
+        generate_fn = getattr(model, "_old_generate", model.generate)
+        outputs = generate_fn(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            max_new_tokens=512,
+            temperature=0.1,
+            do_sample=True,
+        )
     latency = time.perf_counter() - start
 
     raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
