@@ -27,6 +27,12 @@ from pathlib import Path
 # Unbuffered output for real-time tqdm in Colab subprocess
 os.environ["PYTHONUNBUFFERED"] = "1"
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+
+import logging
+logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
+
 import torch
 from datasets import load_dataset
 from transformers import TrainerCallback
@@ -78,8 +84,10 @@ def auto_detect_gpu() -> dict:
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
-    if gpu_mem_gb >= 35:  # A100
-        batch_size, grad_accum = 4, 8
+    if gpu_mem_gb >= 70:  # H100 80GB — max throughput
+        batch_size, grad_accum = 16, 2
+    elif gpu_mem_gb >= 35:  # A100 40/80GB
+        batch_size, grad_accum = 8, 4
     elif gpu_mem_gb >= 20:  # L4
         batch_size, grad_accum = 4, 4
     else:  # T4 or smaller

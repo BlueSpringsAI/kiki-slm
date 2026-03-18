@@ -3,6 +3,7 @@
 
 Loads models sequentially (base first, then fine-tuned) to avoid OOM on T4.
 Strips Qwen3 <think> tokens before JSON parsing.
+Batched inference for faster evaluation on high-VRAM GPUs.
 
 Self-contained — does NOT import from the kiki package.
 
@@ -18,12 +19,18 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import os
 import re
 import time
+import warnings
 from pathlib import Path
 
 os.environ["PYTHONUNBUFFERED"] = "1"
+
+# Suppress the transformers FutureWarning logging bug
+warnings.filterwarnings("ignore", category=FutureWarning, module="transformers")
+logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
 
 import torch
 
@@ -39,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gold-file", required=True, help="Path to gold JSONL")
     parser.add_argument("--output-file", default=None, help="Where to save results JSON")
     parser.add_argument("--max-seq-length", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=0, help="Batch size for inference (0=auto-detect)")
     return parser.parse_args()
 
 
@@ -98,37 +106,97 @@ def parse_model_json(raw_text: str) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# Inference
+# GPU detection
 # ---------------------------------------------------------------------------
 
-def run_inference(model, tokenizer, message: str) -> tuple[dict | None, str, float]:
-    prompt = tokenizer.apply_chat_template(
-        [{"role": "system", "content": EVAL_SYSTEM_PROMPT}, {"role": "user", "content": message}],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-    input_len = inputs["input_ids"].shape[1]
-
-    start = time.perf_counter()
-    with torch.no_grad():
-        outputs = model.generate(**inputs, max_new_tokens=512, temperature=0.1, do_sample=True)
-    latency = time.perf_counter() - start
-
-    raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-    parsed = parse_model_json(raw)
-    return parsed, raw, latency
+def auto_detect_batch_size() -> int:
+    """Auto-detect inference batch size based on GPU VRAM."""
+    if not torch.cuda.is_available():
+        return 1
+    vram_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    if vram_gb >= 70:   # H100 80GB
+        return 16
+    if vram_gb >= 35:   # A100 40/80GB
+        return 8
+    if vram_gb >= 20:   # L4
+        return 4
+    return 1             # T4 or smaller — sequential
 
 
-def evaluate_model(model, tokenizer, tickets: list[dict], label: str) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Batched inference
+# ---------------------------------------------------------------------------
+
+def run_batched_inference(
+    model, tokenizer, messages: list[str], batch_size: int,
+) -> list[tuple[dict | None, str, float]]:
+    """Run inference in batches for faster evaluation on high-VRAM GPUs."""
     results = []
+
+    for batch_start in range(0, len(messages), batch_size):
+        batch_msgs = messages[batch_start:batch_start + batch_size]
+
+        # Build prompts
+        prompts = []
+        for msg in batch_msgs:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "system", "content": EVAL_SYSTEM_PROMPT},
+                 {"role": "user", "content": msg}],
+                tokenize=False, add_generation_prompt=True,
+            )
+            prompts.append(prompt)
+
+        if batch_size == 1 or len(prompts) == 1:
+            # Sequential (T4 or single item) — no padding needed
+            for prompt in prompts:
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                input_len = inputs["input_ids"].shape[1]
+
+                start = time.perf_counter()
+                with torch.no_grad():
+                    outputs = model.generate(**inputs, max_new_tokens=512, temperature=0.1, do_sample=True)
+                latency = time.perf_counter() - start
+
+                raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+                parsed = parse_model_json(raw)
+                results.append((parsed, raw, latency))
+        else:
+            # Batched — pad and generate together
+            tokenizer.padding_side = "left"
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True,
+                              max_length=2048).to(model.device)
+            input_lens = [inputs["attention_mask"][i].sum().item() for i in range(len(prompts))]
+
+            start = time.perf_counter()
+            with torch.no_grad():
+                outputs = model.generate(**inputs, max_new_tokens=512, temperature=0.1, do_sample=True)
+            total_latency = time.perf_counter() - start
+            per_latency = total_latency / len(prompts)
+
+            for i in range(len(prompts)):
+                raw = tokenizer.decode(outputs[i][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+                parsed = parse_model_json(raw)
+                results.append((parsed, raw, per_latency))
+
+            tokenizer.padding_side = "right"
+
+    return results
+
+
+def evaluate_model(model, tokenizer, tickets: list[dict], label: str, batch_size: int) -> list[dict]:
+    """Run a model on all gold tickets with batched inference."""
+    messages = [t["customer_message"] for t in tickets]
     total = len(tickets)
-    for i, ticket in enumerate(tickets, 1):
-        msg = ticket["customer_message"]
-        tid = ticket.get("ticket_id", f"ticket_{i}")
-        if i % 10 == 0 or i == 1 or i == total:
-            print(f"    [{i}/{total}] {tid}...")
-        parsed, raw, latency = run_inference(model, tokenizer, msg)
+
+    print(f"    Running {label} inference (batch_size={batch_size})...")
+    start = time.perf_counter()
+    infer_results = run_batched_inference(model, tokenizer, messages, batch_size)
+    total_time = time.perf_counter() - start
+    print(f"    Completed {total} tickets in {total_time:.1f}s ({total_time/total:.2f}s/ticket avg)")
+
+    results = []
+    for i, (parsed, raw, latency) in enumerate(infer_results):
+        tid = tickets[i].get("ticket_id", f"ticket_{i+1}")
         results.append({"ticket_id": tid, "parsed": parsed, "raw": raw, "latency": latency})
     return results
 
@@ -232,6 +300,9 @@ def main():
 
     tickets = load_gold_data(args.gold_file)
 
+    batch_size = args.batch_size if args.batch_size > 0 else auto_detect_batch_size()
+    print(f"  Inference batch size: {batch_size}")
+
     # --- Base model (load, evaluate, free) ---
     print(f"\n  Loading BASE model: {args.base_model}")
     from unsloth import FastLanguageModel
@@ -243,8 +314,7 @@ def main():
     )
     FastLanguageModel.for_inference(base_model)
 
-    print(f"  Running base model on {len(tickets)} tickets...")
-    base_results = evaluate_model(base_model, base_tokenizer, tickets, "Base")
+    base_results = evaluate_model(base_model, base_tokenizer, tickets, "Base", batch_size)
 
     print(f"  Freeing base model VRAM...")
     free_model(base_model)
@@ -260,8 +330,7 @@ def main():
     )
     FastLanguageModel.for_inference(ft_model)
 
-    print(f"  Running fine-tuned model on {len(tickets)} tickets...")
-    ft_results = evaluate_model(ft_model, ft_tokenizer, tickets, "Fine-tuned")
+    ft_results = evaluate_model(ft_model, ft_tokenizer, tickets, "Fine-tuned", batch_size)
 
     free_model(ft_model)
     del ft_tokenizer
