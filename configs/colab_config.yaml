@@ -42,9 +42,9 @@ training:
 
   # GPU-specific batch sizes (auto-selected based on VRAM)
   gpu_profiles:
-    h100:  # >= 70GB
-      batch_size: 32
-      grad_accum: 1
+    h100:  # >= 70GB (H100, RTX PRO 6000 Blackwell, etc.)
+      batch_size: 8
+      grad_accum: 4
     a100:  # >= 35GB
       batch_size: 8
       grad_accum: 4
