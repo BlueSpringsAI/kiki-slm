@@ -1,8 +1,8 @@
 .PHONY: install install-dev install-gpu train-sft train-alignment evaluate serve serve-mlx \
        merge-export download-data docker-build docker-up docker-down clean help
 
-PYTHON := python
 UV := uv
+PYTHON := $(UV) run python
 
 # ─── Installation ────────────────────────────────────────────────────────────
 
