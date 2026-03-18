@@ -215,7 +215,10 @@ def compute_metrics(results: list[dict], tickets: list[dict]) -> dict:
         latencies.append(res["latency"])
         if p is not None:
             json_valid += 1
-            if p.get("intent", "").lower() == ticket.get("gold_intent", "").lower():
+            pred_intent = p.get("intent", "").lower()
+            gold_intent = ticket.get("gold_intent", "").lower()
+            gold_secondary = ticket.get("gold_intent_secondary", "").lower()
+            if pred_intent == gold_intent or (gold_secondary and pred_intent == gold_secondary):
                 intent_correct += 1
             if p.get("urgency", "").lower() == ticket.get("gold_urgency", "").lower():
                 urgency_correct += 1
