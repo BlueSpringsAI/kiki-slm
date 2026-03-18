@@ -265,6 +265,7 @@ def main():
         r=args.lora_r,
         lora_alpha=args.lora_alpha,
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        modules_to_save=["embed_tokens", "lm_head"],  # Critical for Qwen3 EOS token learning
         lora_dropout=0,
         bias="none",
         use_gradient_checkpointing="unsloth",
@@ -276,8 +277,13 @@ def main():
 
     # 8. Apply chat template
     tokenizer.padding_side = "right"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # Ensure EOS is <|im_end|> (Qwen3 changed default in some tokenizer versions)
+    if tokenizer.eos_token != "<|im_end|>":
+        tokenizer.eos_token = "<|im_end|>"
+    # PAD must differ from EOS — otherwise EOS gets masked during training
+    # and the model never learns to stop generating
+    if tokenizer.pad_token is None or tokenizer.pad_token == tokenizer.eos_token:
+        tokenizer.pad_token = "<|PAD_TOKEN|>"
 
     print("\n  Applying chat template...")
     train_dataset, original_template = apply_chat_template_to_dataset(train_dataset, tokenizer)
