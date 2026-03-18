@@ -32,60 +32,65 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 SFT_DATASETS = {
+    # --- Real CS conversations (highest weight — these have real responses) ---
     "bitext_cs": {
         "hf_id": "bitext/Bitext-customer-support-llm-chatbot-training-dataset",
         "converter": "bitext",
-        "weight": 0.15,
+        "weight": 0.20,
         "description": "General CS (27K)",
     },
     "bitext_ecom": {
         "hf_id": "bitext/Bitext-retail-ecommerce-llm-chatbot-training-dataset",
         "converter": "bitext",
-        "weight": 0.15,
+        "weight": 0.20,
         "description": "E-commerce (50K+)",
     },
+    "customer_support_tickets": {
+        "hf_id": "Tobi-Bueck/customer-support-tickets",
+        "converter": "ticket",
+        "weight": 0.15,
+        "filter_language": "en",
+        "description": "Helpdesk tickets (61.8K, English subset — ONLY source of technical_support)",
+    },
+    # --- Vertical-specific CS (lower weight — useful but narrower domain) ---
     "bitext_banking": {
         "hf_id": "bitext/Bitext-retail-banking-llm-chatbot-training-dataset",
         "converter": "bitext",
-        "weight": 0.10,
+        "weight": 0.05,
         "description": "Banking (37K+)",
     },
     "bitext_insurance": {
         "hf_id": "bitext/Bitext-insurance-llm-chatbot-training-dataset",
         "converter": "bitext",
-        "weight": 0.10,
+        "weight": 0.05,
         "description": "Insurance (38K+)",
     },
-    "customer_support_tickets": {
-        "hf_id": "Tobi-Bueck/customer-support-tickets",
-        "converter": "ticket",
-        "weight": 0.10,
-        "filter_language": "en",
-        "description": "Helpdesk tickets (61.8K, English subset)",
-    },
+    # --- Intent classification (lower weight — synthetic responses, useful for classification) ---
     "banking77": {
         "hf_id": "legacy-datasets/banking77",
         "converter": "banking77",
-        "weight": 0.10,
-        "description": "Banking intent 77-class (13K)",
+        "weight": 0.05,
+        "description": "Banking intent 77-class (10K)",
     },
     "clinc_oos": {
         "hf_id": "clinc/clinc_oos",
         "subset": "plus",
         "converter": "clinc",
-        "weight": 0.05,
-        "description": "Intent + OOS (23.7K)",
+        "weight": 0.02,
+        "filter_clinc_cs_only": True,
+        "description": "Intent + OOS — CS-relevant intents only (filtered from 23.7K)",
     },
+    # --- Tool calling / agentic (important for tool selection training) ---
     "arcee_agent": {
         "hf_id": "arcee-ai/agent-data",
         "converter": "arcee_agent",
-        "weight": 0.10,
+        "weight": 0.15,
         "description": "Agent data (486K)",
     },
     "xlam_60k": {
         "hf_id": "Salesforce/xlam-function-calling-60k",
         "converter": "xlam",
-        "weight": 0.10,
+        "weight": 0.08,
         "description": "Function calling (60K)",
     },
     "hermes_fc": {
@@ -94,6 +99,22 @@ SFT_DATASETS = {
         "weight": 0.05,
         "description": "Tool calling (11.6K)",
     },
+}
+
+# CS-relevant CLINC intents (filter out weather, jokes, recipes, etc.)
+CLINC_CS_INTENTS = {
+    "order_status", "order", "order_checks", "bill_balance", "bill_due",
+    "pay_bill", "min_payment", "transactions", "spending_history", "balance",
+    "credit_score", "credit_limit", "credit_limit_change", "interest_rate",
+    "apr", "international_fees", "exchange_rate", "redeem_rewards",
+    "rewards_balance", "income", "taxes", "w2", "payday", "rollover_401k",
+    "card_declined", "transfer", "direct_deposit",
+    "report_fraud", "report_lost_card", "freeze_account",
+    "account_blocked", "pin_change", "reset_settings", "change_user_name",
+    "cancel", "cancel_reservation",
+    "new_card", "insurance", "insurance_change", "damaged_card",
+    "replacement_card_duration", "lost_luggage",
+    "oos",  # Keep OOS for general_inquiry training
 }
 
 
@@ -137,6 +158,17 @@ def download_and_convert(
         before = len(ds)
         ds = ds.filter(lambda x: x.get("language") == lang_filter)
         logger.info("  Filtered to language='%s': %d -> %d", lang_filter, before, len(ds))
+
+    # Filter CLINC to CS-relevant intents only (remove weather, jokes, recipes, etc.)
+    if config.get("filter_clinc_cs_only") and "intent" in ds.column_names:
+        before = len(ds)
+        # CLINC uses integer labels — resolve to names and filter
+        features = ds.features.get("intent")
+        if hasattr(features, "int2str"):
+            ds = ds.filter(lambda x: features.int2str(x["intent"]) in CLINC_CS_INTENTS)
+        else:
+            ds = ds.filter(lambda x: str(x.get("intent", "")) in CLINC_CS_INTENTS)
+        logger.info("  Filtered to CS-relevant intents: %d -> %d", before, len(ds))
 
     # Convert ALL rows to ChatML first — then subsample from valid results
     converter = ChatMLConverter.get_converter(converter_name)

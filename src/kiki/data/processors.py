@@ -46,6 +46,35 @@ def _msg(role: str, content: str) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# Urgency escalation based on message keywords
+# ---------------------------------------------------------------------------
+
+_URGENT_KEYWORDS = (
+    "urgent", "immediately", "asap", "right now", "emergency",
+    "deadline", "can't wait", "frustrated", "unacceptable",
+    "been waiting", "still waiting", "no response", "multiple times",
+    "lawyer", "legal", "sue", "report", "bbb", "attorney general",
+)
+_CRITICAL_KEYWORDS = (
+    "fraud", "unauthorized", "stolen", "hacked", "identity theft",
+    "locked out", "can't access", "data breach", "security",
+)
+
+
+def _escalate_urgency(base_urgency: str, message: str) -> str:
+    """Escalate urgency based on keywords in the customer message."""
+    msg_lower = message.lower()
+    if any(kw in msg_lower for kw in _CRITICAL_KEYWORDS):
+        return "critical"
+    if any(kw in msg_lower for kw in _URGENT_KEYWORDS):
+        if base_urgency == "low":
+            return "medium"
+        if base_urgency == "medium":
+            return "high"
+    return base_urgency
+
+
+# ---------------------------------------------------------------------------
 # ChatMLConverter
 # ---------------------------------------------------------------------------
 
@@ -108,7 +137,8 @@ class ChatMLConverter:
         original_intent = example.get("intent", "")
 
         kiki_intent = ChatMLConverter._BITEXT_CATEGORY_TO_KIKI.get(category, "general_inquiry")
-        urgency = ChatMLConverter._BITEXT_CATEGORY_URGENCY.get(category, "medium")
+        base_urgency = ChatMLConverter._BITEXT_CATEGORY_URGENCY.get(category, "medium")
+        urgency = _escalate_urgency(base_urgency, user_text)
         tools = ChatMLConverter._BITEXT_INTENT_TOOLS.get(kiki_intent, ["ticket_update_api"])
         steps = ChatMLConverter._BITEXT_INTENT_STEPS.get(kiki_intent, ["assess_request", "resolve_issue"])
 
@@ -170,7 +200,8 @@ class ChatMLConverter:
         ticket_type = example.get("type", "")
 
         kiki_intent = ChatMLConverter._TICKET_QUEUE_TO_KIKI.get(queue, "general_inquiry")
-        urgency = ChatMLConverter._TICKET_PRIORITY_TO_URGENCY.get(priority, "medium")
+        base_urgency = ChatMLConverter._TICKET_PRIORITY_TO_URGENCY.get(priority, "medium")
+        urgency = _escalate_urgency(base_urgency, user_text)
         tools = ChatMLConverter._TICKET_INTENT_TOOLS.get(kiki_intent, ["ticket_update_api"])
         steps = ChatMLConverter._TICKET_INTENT_STEPS.get(kiki_intent, ["assess_request", "resolve_issue"])
 
@@ -410,7 +441,8 @@ class ChatMLConverter:
             intent = str(label).lower().replace(" ", "_")
 
         kiki_intent = ChatMLConverter._BANKING77_TO_KIKI.get(intent, "general_inquiry")
-        urgency = ChatMLConverter._BANKING77_URGENCY.get(intent, "medium")
+        base_urgency = ChatMLConverter._BANKING77_URGENCY.get(intent, "medium")
+        urgency = _escalate_urgency(base_urgency, text)
         human_intent = intent.replace("_", " ")
 
         tools = ChatMLConverter._BITEXT_INTENT_TOOLS.get(kiki_intent, ["customer_profile_api"])
@@ -530,7 +562,8 @@ class ChatMLConverter:
 
         is_oos = intent == "oos"
         kiki_intent = "general_inquiry" if is_oos else ChatMLConverter._CLINC_TO_KIKI.get(intent, "general_inquiry")
-        urgency = ChatMLConverter._CLINC_URGENCY.get(intent, "low" if is_oos else "medium")
+        base_urgency = ChatMLConverter._CLINC_URGENCY.get(intent, "low" if is_oos else "medium")
+        urgency = _escalate_urgency(base_urgency, text)
         human_intent = intent.replace("_", " ")
 
         tools = ChatMLConverter._BITEXT_INTENT_TOOLS.get(kiki_intent, ["ticket_update_api"])
