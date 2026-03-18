@@ -11,6 +11,7 @@ import time
 from abc import ABC, abstractmethod
 from typing import Any
 
+from kiki.utils.callbacks import KikiMetricsCallback
 from kiki.utils.config import config_to_dict, load_config
 from kiki.utils.experiment_tracker import ExperimentTracker
 from kiki.utils.gpu_utils import clear_gpu_cache, get_gpu_memory
@@ -52,6 +53,7 @@ class BaseTrainer(ABC):
         self._log_gpu_stats("after_model_load")
 
         self.setup_trainer(train_dataset, eval_dataset)
+        self._inject_callbacks()
 
         self._start_time = time.time()
         result = self.train()
@@ -91,6 +93,13 @@ class BaseTrainer(ABC):
         clear_gpu_cache()
         self.tracker.finish()
         logger.info("Training cleanup complete")
+
+    def _inject_callbacks(self) -> None:
+        """Add KikiMetricsCallback to the TRL trainer."""
+        if self.trainer is not None:
+            callback = KikiMetricsCallback(tracker=self.tracker)
+            self.trainer.add_callback(callback)
+            logger.info("Injected KikiMetricsCallback into trainer")
 
     def _log_gpu_stats(self, stage: str = "") -> None:
         """Log current GPU memory usage."""

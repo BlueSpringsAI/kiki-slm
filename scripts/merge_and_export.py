@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+from kiki.utils.logging import setup_logging
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_MODEL = "Qwen/Qwen3-4B-Instruct-2507"

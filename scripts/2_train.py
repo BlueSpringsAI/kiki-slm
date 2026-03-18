@@ -22,13 +22,11 @@ from pathlib import Path
 
 import yaml
 
+from kiki.utils.logging import setup_logging
+
 # ── Logging setup ─────────────────────────────────────────────────────────
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
+setup_logging()
 logger = logging.getLogger(__name__)
 
 

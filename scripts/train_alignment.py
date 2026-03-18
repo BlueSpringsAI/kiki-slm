@@ -13,7 +13,9 @@ import argparse
 import logging
 import sys
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+from kiki.utils.logging import setup_logging
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -43,18 +45,37 @@ def main() -> None:
     method = getattr(config.alignment, "method", "dpo") if hasattr(config, "alignment") else "dpo"
     logger.info("Alignment method: %s", method)
 
-    # Load data
+    # Load data — supports multiple datasets with proportional weighting
+    import datasets as ds_lib
     from datasets import load_dataset
 
     if args.data_path:
         train_dataset = load_dataset("json", data_files=args.data_path, split="train")
     elif hasattr(config, "datasets"):
-        data_cfg = config.datasets[0]
-        path = getattr(data_cfg, "path", None) or getattr(data_cfg, "id", "")
-        if path.endswith(".jsonl"):
-            train_dataset = load_dataset("json", data_files=path, split="train")
+        parts: list[tuple] = []
+        for data_cfg in config.datasets:
+            path = getattr(data_cfg, "path", None) or getattr(data_cfg, "id", "")
+            weight = float(getattr(data_cfg, "weight", 1.0))
+            if path.endswith(".jsonl"):
+                ds = load_dataset("json", data_files=path, split="train")
+            else:
+                ds = load_dataset(path, split="train")
+            parts.append((ds, weight))
+            logger.info("Loaded '%s': %d examples (weight=%.2f)", path, len(ds), weight)
+
+        if len(parts) == 1:
+            train_dataset = parts[0][0]
         else:
-            train_dataset = load_dataset(path, split="train")
+            # Sample each dataset proportionally by weight, then concatenate
+            total_weight = sum(w for _, w in parts)
+            total_available = sum(len(d) for d, _ in parts)
+            sampled = []
+            for ds, weight in parts:
+                ratio = weight / total_weight
+                n = min(len(ds), max(1, int(total_available * ratio)))
+                sampled.append(ds.shuffle(seed=42).select(range(n)))
+            train_dataset = ds_lib.concatenate_datasets(sampled).shuffle(seed=42)
+            logger.info("Combined %d datasets: %d total examples", len(parts), len(train_dataset))
     else:
         logger.error("No data source specified")
         sys.exit(1)
@@ -68,6 +89,7 @@ def main() -> None:
 
     elif method == "grpo":
         from kiki.rewards import CompositeReward
+        from kiki.utils.reward_tracker import TrackedReward
 
         # Build reward functions
         reward_weights = None
@@ -75,12 +97,16 @@ def main() -> None:
             reward_weights = {k: v.weight for k, v in config.rewards.items()}
 
         composite = CompositeReward(weights=reward_weights)
-        reward_fns = [composite]
 
         from kiki.trainers.grpo_trainer import KikiGRPOTrainer
 
-        trainer = KikiGRPOTrainer(args.config, reward_functions=reward_fns, overrides=overrides or None)
-        trainer.run(train_dataset)
+        grpo_trainer = KikiGRPOTrainer(args.config, reward_functions=[composite], overrides=overrides or None)
+
+        # Wrap composite in TrackedReward after trainer init so tracker is available
+        tracked = TrackedReward(composite, tracker=grpo_trainer.tracker)
+        grpo_trainer.reward_functions = [tracked]
+
+        grpo_trainer.run(train_dataset)
 
     elif method == "kto":
         from kiki.trainers.kto_trainer import KikiKTOTrainer

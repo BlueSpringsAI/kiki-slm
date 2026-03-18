@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from kiki.utils.logging import setup_logging
+
+setup_logging()
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -751,6 +755,8 @@ def main():
     if not tickets:
         print("  ERROR: No gold tickets loaded. Exiting.")
         return
+    if len(tickets) < 30:
+        print(f"  WARNING: Only {len(tickets)} gold tickets — metrics will not be statistically meaningful. Aim for 100+.")
 
     print(f"\n[3/5] Running evaluation")
     results = asyncio.run(evaluate_all(

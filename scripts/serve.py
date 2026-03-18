@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+from kiki.utils.logging import setup_logging
+
+setup_logging(json_output=os.environ.get("KIKI_LOG_JSON", "").lower() in ("1", "true"))
 logger = logging.getLogger(__name__)
 
 

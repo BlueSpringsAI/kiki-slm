@@ -24,8 +24,9 @@ from kiki.data.processors import ChatMLConverter
 from kiki.data.quality_filter import QualityFilter
 from kiki.data.dataset_mixer import DatasetMixer
 from kiki.data.validators import ChatMLExample, validate_dataset
+from kiki.utils.logging import setup_logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+setup_logging()
 logger = logging.getLogger(__name__)
 
 _LOADER_MAP = {

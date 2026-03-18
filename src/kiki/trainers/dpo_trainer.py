@@ -91,7 +91,8 @@ class KikiDPOTrainer(BaseTrainer):
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=int(_get("logging_steps", 10)),
-            report_to=list(_get("report_to", ["none"])),
+            # Metrics flow through KikiMetricsCallback → ExperimentTracker, not TRL
+            report_to=["none"],
             seed=int(_get("seed", 42)),
         )
 
