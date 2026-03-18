@@ -78,7 +78,8 @@ class KikiSFTTrainer(BaseTrainer):
             eval_strategy=_get("eval_strategy", "steps") if eval_dataset else "no",
             eval_steps=int(_get("eval_steps", 500)) if eval_dataset else None,
             logging_steps=int(_get("logging_steps", 10)),
-            report_to=list(_get("report_to", ["none"])),
+            # Metrics flow through KikiMetricsCallback → ExperimentTracker, not TRL
+            report_to=["none"],
             seed=int(_get("seed", 42)),
         )
 

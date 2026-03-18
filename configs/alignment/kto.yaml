@@ -1,5 +1,5 @@
 inherits: base.yaml
-task: dpo_alignment
+task: kto_alignment
 output_dir: runs/kto-v1
 base_model_or_adapter: runs/grpo-v1/checkpoint-final
 

@@ -23,7 +23,7 @@ dependencies = [
     "faker>=30.0",
     "sentence-transformers>=3.0",
     # API clients
-    "openai>=1.40.0",
+    "openai>=1.66.0",
     "anthropic>=0.34.0",
     # Evaluation
     "scikit-learn>=1.3",

@@ -20,6 +20,10 @@ from pathlib import Path
 import pandas as pd
 import yaml
 from openai import AsyncOpenAI
+
+from kiki.utils.logging import setup_logging
+
+setup_logging()
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from typing import Optional

@@ -12,7 +12,9 @@ import argparse
 import logging
 import sys
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+from kiki.utils.logging import setup_logging
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -57,7 +59,7 @@ def main() -> None:
         from kiki.data.dataset_mixer import DatasetMixer
 
         datasets_cfg = {d.id: {"loader": "huggingface", "id": d.id, "weight": d.weight} for d in config.datasets}
-        mixer = DatasetMixer(datasets=datasets_cfg, total_examples=50000, seed=42)
+        mixer = DatasetMixer(datasets_config=datasets_cfg, total_examples=50000, seed=42)
         train_dataset = mixer.mix()
     else:
         logger.error("No data source specified. Use --data-path or configure datasets in YAML.")

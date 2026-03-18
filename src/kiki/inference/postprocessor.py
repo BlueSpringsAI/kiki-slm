@@ -12,6 +12,7 @@ import re
 from typing import Any
 
 from kiki.data.validators import SLMOutput, parse_slm_output
+from kiki.utils.logging import log_with_data
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +59,20 @@ class ResponsePostprocessor:
             slm_output.response if slm_output else response
         )
 
-        return {
+        result = {
             "response": clean_response,
             "safe": len(flags) == 0,
             "confidence": round(confidence, 3),
             "escalate": escalate,
             "flags": flags,
         }
+
+        if flags:
+            log_with_data(logger, logging.WARNING, "Safety flags triggered", {"flags": flags, "confidence": confidence, "escalate": escalate})
+        if escalate:
+            log_with_data(logger, logging.WARNING, "Request escalated to human", {"intent": intent, "confidence": confidence, "flags": flags})
+
+        return result
 
     def scan_pii(self, text: str) -> list[dict]:
         """Detect PII patterns in response text."""

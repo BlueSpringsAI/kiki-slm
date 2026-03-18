@@ -21,10 +21,13 @@ class ExperimentTracker:
         self._mlflow_active = False
 
         if config is not None:
-            report_to = getattr(config, "report_to", None)
-            if report_to is None and hasattr(config, "defaults"):
-                report_to = getattr(config.defaults, "report_to", None)
-            self._backends: list[str] = list(report_to) if report_to else []
+            # Prefer experiment_tracking key; fall back to report_to for compat
+            backends = getattr(config, "experiment_tracking", None)
+            if backends is None:
+                backends = getattr(config, "report_to", None)
+            if backends is None and hasattr(config, "defaults"):
+                backends = getattr(config.defaults, "report_to", None)
+            self._backends: list[str] = list(backends) if backends else []
         else:
             self._backends = []
 

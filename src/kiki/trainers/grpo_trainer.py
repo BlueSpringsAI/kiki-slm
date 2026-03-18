@@ -68,15 +68,19 @@ class KikiGRPOTrainer(BaseTrainer):
             output_dir=getattr(self.config, "output_dir", "runs/grpo-default"),
             learning_rate=float(getattr(alignment, "learning_rate", 1e-6)),
             per_device_train_batch_size=int(getattr(alignment, "per_device_train_batch_size", 4)),
+            gradient_accumulation_steps=int(getattr(alignment, "gradient_accumulation_steps", 1)),
             num_train_epochs=int(getattr(alignment, "num_train_epochs", 1)),
             num_generations=int(getattr(alignment, "num_generations", 8)),
             max_completion_length=int(getattr(alignment, "max_completion_length", 512)),
             max_prompt_length=int(getattr(alignment, "max_prompt_length", 1024)),
+            beta=float(getattr(alignment, "kl_coef", 0.04)),
             bf16=True,
             gradient_checkpointing=True,
             gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_steps=10,
-            report_to=list(getattr(alignment, "report_to", ["none"])),
+            seed=int(getattr(alignment, "seed", 42)),
+            # Metrics flow through KikiMetricsCallback → ExperimentTracker, not TRL
+            report_to=["none"],
         )
 
         # vLLM integration for fast generation
