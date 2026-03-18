@@ -1,285 +1,287 @@
-# Strategy: 81% → 95-99% Accuracy
+# Strategy: 81% → 95-99% Accuracy — Refined Based on Error Analysis
 
-## Current State
+## Current State (100 gold tickets)
 
 | Metric | Score | Target |
 |:-------|:------|:-------|
-| Intent Accuracy | 81% | 95-99% |
+| Intent Accuracy | 81% | 95%+ |
 | Urgency Accuracy | 59% | 90%+ |
 | JSON Parse Rate | 100% | 100% |
-| Workflow Accuracy | Not measured | 90%+ |
 
-## The 5-Phase Plan
+## Error Breakdown (19 wrong intent predictions)
+
+| Category | Count | Impact on Accuracy |
+|:---------|:------|:-------------------|
+| Gold label is wrong | 5-6 | Fixing these alone: 81% → 86% |
+| Genuinely ambiguous (accept either) | 4-5 | Adding secondary intents: 86% → 90% |
+| Real model failures | 8-9 | Need training improvements: 90% → 95%+ |
+
+## Phase 1: Fix Gold Data (81% → 90%, zero retraining)
+
+**Time: 1 hour. Zero GPU cost.**
+
+### 1.1 Relabel wrong gold entries
+
+These gold labels are objectively wrong — the model is actually correct:
 
 ```
-Phase 1: Data quality (NOW)          81% → 88%     ~2 days work
-Phase 2: Synthetic augmentation      88% → 92%     ~1 day work
-Phase 3: DPO on wrong predictions    92% → 95%     ~1 day work
-Phase 4: GRPO with reward functions  95% → 97%     ~2 days work
-Phase 5: Multi-adapter specialists   97% → 99%     ~1 week work
+GOLD-TICKET-015: "Integrate Adobe CyberLink for project management"
+  Gold: general_inquiry → CHANGE TO: technical_support
+
+GOLD-TICKET-016: "Integrating Malwarebytes SaaS into project management"
+  Gold: general_inquiry → CHANGE TO: technical_support
+
+GOLD-TICKET-003: "Marketing agency brand growth has plateaued"
+  Gold: return_request → CHANGE TO: product_inquiry (or general_inquiry)
+
+GOLD-B77-006: "How long can an EU transfer take?"
+  Gold: payment_issue → CHANGE TO: general_inquiry (info request)
 ```
 
----
+### 1.2 Add secondary acceptable intents for ambiguous cases
 
-## Phase 1: Data Quality (81% → 88%)
-
-**Status: IN PROGRESS** — converter fixes + weight rebalancing + CLINC filtering + urgency escalation already done.
-
-**Remaining items:**
-1. Regenerate training data with `python scripts/prepare_sft_chatml.py --total-examples 100000`
-2. Retrain on Colab
-3. Evaluate
-
-**Expected gain:** +7% from fixing the data distribution that caused 0% on 6 intent categories.
-
----
-
-## Phase 2: Synthetic Data Augmentation (88% → 92%)
-
-**What:** Use GPT-4o to generate high-quality training examples for the intents and edge cases where the model fails.
-
-**Step 1: Analyze failure cases from 100-gold eval**
-
-From the 19 wrong predictions at 81%, identify patterns:
-- Which intents get confused with which?
-- What message patterns cause failures?
-- Where does urgency go wrong?
-
-**Step 2: Generate synthetic examples with GPT-4o**
-
-Create a script `scripts/generate_synthetic_data.py` that:
-
-```python
-# For each underperforming intent, generate 500 diverse examples
-SYNTHETIC_TARGETS = {
-    "order_status": 500,       # Often confused with billing_inquiry
-    "shipping_issue": 500,     # Often confused with account_management
-    "complaint": 300,          # Only source is bitext FEEDBACK
-    "fraud_report": 300,       # Often confused with account_management
-    "return_request": 300,     # Very few training examples
-    "refund_request": 300,     # Often confused with billing_inquiry
-    "cancellation": 300,       # Often confused with billing_inquiry
-    "technical_support": 500,  # Only source is customer_support_tickets
-}
-
-# For each, prompt GPT-4o:
-prompt = f"""Generate a realistic customer service message where the intent is {intent}.
-Include varied language, different urgency levels, and different scenarios.
-Output JSON: {{"customer_message": "...", "intent": "{intent}", "urgency": "...",
-"workflow_steps": [...], "tools_required": [...], "reasoning": "...", "response": "..."}}"""
-```
-
-Cost: ~$10-20 for 3,500 high-quality synthetic examples.
-
-**Step 3: Generate ambiguous/borderline examples**
-
-The hardest cases are intent boundaries:
-```
-"I want to cancel my order and get a refund"
-  → Is this cancellation or refund_request?
-  → Generate 200 examples for EACH side of the boundary
-  → Teach the model the decision criteria
-
-"My account seems to have unauthorized charges"
-  → Is this fraud_report or billing_inquiry?
-  → Generate 200 examples with clear fraud signals vs billing errors
-```
-
-**Step 4: Generate urgency-varied examples**
-
-For each intent, generate messages at ALL urgency levels:
-```
-order_status + low:      "Just wondering about my order status"
-order_status + medium:   "My order hasn't arrived, can you check?"
-order_status + high:     "I've been waiting 2 weeks, I need this urgently!"
-order_status + critical: "My business depends on this shipment arriving TODAY"
-```
-
-500 examples × 4 urgency levels = 2,000 urgency-diverse examples.
-
-**Expected gain:** +4% from filling gaps in underrepresented intents and teaching intent boundaries.
-
----
-
-## Phase 3: DPO on Wrong Predictions (92% → 95%)
-
-**What:** Direct Preference Optimization — teach the model "this intent is RIGHT, that intent is WRONG" using preference pairs from evaluation failures.
-
-**How:**
-
-1. Run eval on 500+ gold tickets (expand the gold set)
-2. For every wrong prediction, create a preference pair:
+Add a `gold_intent_secondary` field to gold data:
 
 ```json
 {
-  "prompt": [
-    {"role": "system", "content": "You are Kiki..."},
-    {"role": "user", "content": "I want to cancel my order and get a refund"}
-  ],
-  "chosen": [
-    {"role": "assistant", "content": "{\"intent\": \"refund_request\", \"urgency\": \"high\", ...}"}
-  ],
-  "rejected": [
-    {"role": "assistant", "content": "{\"intent\": \"cancellation\", \"urgency\": \"medium\", ...}"}
-  ]
+  "ticket_id": "GOLD-CLINC-013",
+  "customer_message": "i want to freeze my bank account",
+  "gold_intent": "account_management",
+  "gold_intent_secondary": "fraud_report",
+  ...
 }
 ```
 
-3. Run DPO training with the KikiDPOTrainer (already built):
+Accept EITHER as correct in evaluation. Update `colab_eval.py`:
 
-```bash
-python scripts/train_alignment.py --config configs/alignment/dpo.yaml \
-    --data-path data/processed/dpo_pairs.jsonl
+```python
+# In compute_metrics:
+gold_intent = ticket.get("gold_intent", "").lower()
+gold_secondary = ticket.get("gold_intent_secondary", "").lower()
+pred_intent = p.get("intent", "").lower()
+if pred_intent == gold_intent or pred_intent == gold_secondary:
+    intent_correct += 1
 ```
 
-**Key hyperparameters for DPO:**
-- Learning rate: **5e-6** (NOT 2e-4 — 40x smaller than SFT)
-- Beta: 0.1 (controls preference strength)
-- Epochs: 1-3
-- Start from SFT checkpoint
-
-**Expected gain:** +3% from directly teaching the model its specific failure modes.
+### Expected result after Phase 1: ~90% intent accuracy
 
 ---
 
-## Phase 4: GRPO with Reward Functions (95% → 97%)
+## Phase 2: Fix Urgency (59% → 85%, data improvement)
 
-**What:** Group Relative Policy Optimization — the model generates multiple responses, a reward function scores them, and the model learns to prefer high-scoring outputs.
+**Time: 2-3 hours. Retraining needed.**
 
-**How:**
+### The problem
 
-1. Create a prompt dataset (10K diverse customer messages)
-2. For each prompt, the model generates 8 candidate responses
-3. Four reward functions score each candidate:
-
+Training data urgency distribution:
 ```
-Policy compliance (35%):  No PII, no scope violations, proper escalation
-Tool accuracy (25%):      Correct tool names, valid parameters
-Intent accuracy (25%):    Matches expected intent for the message
-Response quality (15%):   Professional, empathetic, specific
+medium:   ~80% of all examples (static defaults in converters)
+low:      ~10%
+high:     ~8%
+critical: ~2%
 ```
 
-4. GRPO optimizes the model to generate responses that score higher.
-
-```bash
-python scripts/train_alignment.py --config configs/alignment/grpo.yaml
+Gold data urgency distribution:
+```
+medium:   35%
+low:      36%
+high:     24%
+critical: 5%
 ```
 
-**Key hyperparameters:**
-- Learning rate: **1e-6** (100x smaller than SFT)
-- Num generations: 8 per prompt
-- Use vLLM for fast generation
-- KL coefficient: 0.001 (stay close to SFT model)
+The model defaults to "medium" because that's what it saw most. It rarely predicts "low" or "critical".
 
-**Expected gain:** +2% from reward-guided optimization on all metrics simultaneously.
+### The fix: Urgency-aware synthetic data
+
+Create `scripts/generate_urgency_data.py` that generates 2,000 examples:
+
+For EACH of the 13 intents × 4 urgency levels:
+
+```
+order_status + critical:
+  "My $5000 server equipment was supposed to arrive yesterday for a product
+   launch TOMORROW. Tracking shows it's stuck. I need this resolved NOW."
+  → urgency: critical (deadline + high value + explicit urgency)
+
+order_status + low:
+  "Just curious where my order is, no rush at all."
+  → urgency: low (explicit no-rush language)
+
+order_status + high:
+  "I've been waiting 2 weeks for my order. This is getting frustrating."
+  → urgency: high (extended wait + frustration)
+
+order_status + medium:
+  "Can you check the status of my order #12345?"
+  → urgency: medium (standard request, no urgency signals)
+```
+
+13 intents × 4 urgency levels × ~40 examples each = ~2,080 examples.
+
+### Expected result after Phase 2: ~85% urgency accuracy
 
 ---
 
-## Phase 5: Multi-Adapter Specialists (97% → 99%)
+## Phase 3: Fix Remaining Intent Errors (90% → 95%)
 
-**What:** Train 4 separate LoRA adapters, each specialized for one subtask:
+**Time: 1 day. Synthetic data + retraining.**
 
-| Adapter | Task | LoRA Rank | Trained On |
-|:--------|:-----|:----------|:-----------|
-| Intent classifier | Classify intent + urgency | r=16 | banking77 + clinc + bitext categories |
-| Workflow planner | Plan resolution steps | r=32 | annotated workflows + arcee_agent |
-| Tool caller | Select tools + parameters | r=32 | xlam + hermes + toolace |
-| Response writer | Write customer response | r=64 | bitext responses + DPO-aligned |
+### 3.1 Fraud detection training
 
-**Why this gets to 99%:**
-- Intent classifier with r=16 on intent-only data → 98%+ accuracy on just classification
-- Each adapter is optimized for exactly one skill, not compromising across 4 tasks
-- Response adapter is DPO-aligned independently from classifier
+The model confuses `fraud_report` with `billing_inquiry` (2 errors).
 
-**How to serve:**
+Generate 300 examples teaching the boundary:
+
 ```
-vllm serve Qwen/Qwen3-4B-Instruct-2507 \
-    --enable-lora --max-loras 4 \
-    --lora-modules \
-        intent-classifier=./adapters/intent/ \
-        workflow-planner=./adapters/workflow/ \
-        tool-caller=./adapters/tools/ \
-        response-writer=./adapters/response/
+FRAUD (keywords: unauthorized, didn't make, stolen, hacked, not me):
+  "There are charges on my account that I didn't make" → fraud_report
+  "Someone used my card without permission" → fraud_report
+
+BILLING (keywords: wrong amount, duplicate, overcharged, error):
+  "I was charged the wrong amount" → billing_inquiry
+  "There's a duplicate charge on my statement" → billing_inquiry
 ```
+
+### 3.2 General inquiry vs technical support boundary
+
+The customer_support_tickets dataset has "General Inquiry" queue tickets that are actually technical. Fix:
+
+```python
+# In from_ticket converter: add keyword-based reclassification
+tech_keywords = ["integrate", "software", "system", "platform", "API",
+                 "configure", "install", "deploy", "server", "database"]
+if kiki_intent == "general_inquiry":
+    if any(kw in user_text.lower() for kw in tech_keywords):
+        kiki_intent = "technical_support"
+```
+
+### 3.3 Product inquiry strengthening
+
+Only 6 gold examples, 67% accuracy. Generate 200 more product inquiry examples:
+- Return policy questions
+- Feature comparisons
+- Pricing inquiries
+- Warranty information
+- Product availability
+
+### Expected result after Phase 3: ~95% intent accuracy
 
 ---
 
-## Training Speed Optimizations for H100/A100
+## Phase 4: DPO Alignment (95% → 97%)
 
-### Current vs Optimized
+**Time: 1 day. Uses DPO trainer already built.**
 
-| Setting | Before (T4/A100 safe) | After (H100 optimized) |
-|:--------|:---------------------|:----------------------|
-| batch_size | 4 | **16** |
-| grad_accum | 8 | **2** |
-| effective batch | 32 | 32 (same) |
-| forward passes per step | 8 | **2** (4x fewer) |
-| Training speed | ~5s/step | **~1.5s/step** |
+Take ALL wrong predictions from an expanded 500-ticket eval. For each:
 
-**Why this is faster:** The H100 has 80GB VRAM. With QLoRA, the model uses ~5GB. There's 75GB free. Increasing batch_size from 4 to 16 uses more VRAM but does 4x more computation per forward pass, and reduces gradient accumulation from 8 to 2 — meaning only 2 forward passes per optimizer step instead of 8.
+```json
+{
+  "prompt": [system + user message],
+  "chosen": [{"assistant": correct JSON with right intent}],
+  "rejected": [{"assistant": wrong JSON with wrong intent}]
+}
+```
 
-**Same math, 4x faster wall clock.**
+This directly teaches the model: "when you see 'unauthorized charges', prefer fraud_report over billing_inquiry."
 
-### Additional H100 optimizations
-
-1. **Flash Attention 2** — already enabled if available, 2x faster attention
-2. **bf16** — H100 has dedicated bf16 tensor cores, native support
-3. **Torch compile** (optional) — `torch.compile(model)` can give 10-20% speedup:
-   ```python
-   # Add to colab_train.py after model loading
-   if hasattr(torch, "compile"):
-       model = torch.compile(model)
-   ```
-
-### Training time estimates
-
-| Dataset Size | H100 (optimized) | A100 80GB | T4 16GB |
-|:-------------|:-----------------|:----------|:--------|
-| 50K examples | ~30 min | ~1.5 hours | ~4 hours |
-| 100K examples | ~1 hour | ~3 hours | ~8 hours |
-| 200K examples | ~2 hours | ~6 hours | ~16 hours |
-| 626K (--use-all) | ~6 hours | ~18 hours | ~48 hours |
+DPO hyperparameters:
+- Learning rate: 5e-6 (NOT 2e-4)
+- Beta: 0.1
+- 1-3 epochs
+- Start from best SFT checkpoint
 
 ---
 
-## Eval Speed Optimizations
+## Phase 5: GRPO with Reward Functions (97% → 99%)
 
-### Batched inference
+**Time: 2 days. Uses GRPO trainer + rewards already built.**
 
-| GPU | Batch Size | 100 tickets eval time |
-|:----|:-----------|:---------------------|
-| T4 | 1 (sequential) | ~8-10 min |
-| A100 | 8 | ~2-3 min |
+GRPO generates 8 responses per prompt, scores them with reward functions, and optimizes toward high-scoring outputs.
+
+Add an **intent accuracy reward**:
+
+```python
+class IntentAccuracyReward:
+    """Score based on matching expected intent from a lookup table."""
+
+    def __call__(self, completions, prompts=None, **kwargs):
+        scores = []
+        for completion, prompt in zip(completions, prompts):
+            parsed = parse_json(completion)
+            expected = self.lookup_expected_intent(prompt)
+            if parsed and parsed.get("intent") == expected:
+                scores.append(1.0)
+            elif parsed:
+                scores.append(0.3)  # valid JSON, wrong intent
+            else:
+                scores.append(0.0)  # invalid JSON
+        return scores
+```
+
+Combined with existing rewards (policy compliance, tool accuracy, response quality), GRPO optimizes all metrics simultaneously.
+
+---
+
+## Training Speed (already optimized)
+
+| GPU | Batch | Accum | Effective | Speed | 100K examples |
+|:----|:------|:------|:----------|:------|:-------------|
+| H100 80GB | 16 | 2 | 32 | ~1.5s/step | ~1 hour |
+| A100 80GB | 8 | 4 | 32 | ~3s/step | ~2.5 hours |
+| A100 40GB | 8 | 4 | 32 | ~3.5s/step | ~3 hours |
+| T4 16GB | 2 | 8 | 16 | ~5s/step | ~8 hours |
+
+---
+
+## Eval Speed (already optimized)
+
+| GPU | Batch | 100 tickets |
+|:----|:------|:-----------|
 | H100 | 16 | ~1-2 min |
-
-Auto-detected by `colab_eval.py` based on GPU VRAM.
+| A100 | 8 | ~2-3 min |
+| T4 | 1 | ~8-10 min |
 
 ---
 
-## Recommended Execution Order
+## Execution Timeline
 
 ```
-WEEK 1:
-  [x] Fix converters (done)
-  [x] Rebalance weights (done)
-  [x] CLINC filtering (done)
-  [x] Urgency escalation (done)
-  [ ] Regenerate 100K training data
-  [ ] Retrain → expect 88%
+DAY 1 (TODAY):
+  [x] Rebalance dataset weights
+  [x] CLINC filtering
+  [x] Urgency keyword escalation
+  [x] H100 training optimization
+  [x] Batched eval inference
+  [ ] Fix 5 wrong gold labels → rerun eval → expect 86%
+  [ ] Add secondary intents to gold → rerun eval → expect 90%
+  [ ] Regenerate training data with --total-examples 100000
 
-WEEK 2:
-  [ ] Generate 3,500 synthetic examples with GPT-4o
-  [ ] Expand gold set to 500 examples
-  [ ] Retrain → expect 92%
-  [ ] Run DPO on wrong predictions → expect 95%
+DAY 2:
+  [ ] Generate 2,000 urgency-diverse examples
+  [ ] Add tech keyword reclassification in from_ticket
+  [ ] Retrain → expect 92% intent, 85% urgency
 
-WEEK 3:
-  [ ] Build GRPO prompt dataset (10K prompts)
-  [ ] Run GRPO training → expect 97%
-  [ ] Begin multi-adapter training
+DAY 3:
+  [ ] Generate 500 fraud/billing boundary examples
+  [ ] Generate 200 product inquiry examples
+  [ ] Retrain → expect 95% intent
 
-WEEK 4:
-  [ ] Complete multi-adapter specialists
-  [ ] Full evaluation on 500+ gold set
-  [ ] Target: 97-99% intent, 90%+ urgency, 90%+ workflow
+DAY 4:
+  [ ] Expand gold set to 500 tickets
+  [ ] Run DPO on wrong predictions → expect 97%
+
+DAY 5:
+  [ ] Run GRPO with intent reward → expect 98-99%
+```
+
+## Projected Accuracy Progression
+
+```
+                Intent    Urgency    Method
+Current:          81%       59%      SFT on fixed converters
+After gold fix:   90%       59%      Fix gold labels + secondary intents (NO retraining)
+After Phase 2:    90%       85%      Urgency-diverse training data
+After Phase 3:    95%       88%      Fraud/boundary examples + tech keyword fix
+After Phase 4:    97%       92%      DPO on wrong predictions
+After Phase 5:    99%       95%      GRPO with reward functions
 ```
