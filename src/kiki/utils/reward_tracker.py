@@ -23,7 +23,7 @@ class TrackedReward:
         self.tracker = tracker
         self._call_count = 0
 
-    def __call__(self, completions: list[str], **kwargs: Any) -> list[float]:
+    def __call__(self, completions: list[str], step: int | None = None, **kwargs: Any) -> list[float]:
         self._call_count += 1
 
         # Use score_detailed to get per-component breakdown
@@ -45,7 +45,7 @@ class TrackedReward:
         # Push to ExperimentTracker
         metrics = {f"reward/{name}": avg for name, avg in averages.items()}
         metrics["reward/total"] = total_avg
-        self.tracker.log_metrics(metrics)
+        self.tracker.log_metrics(metrics, step=step or self._call_count)
 
         # Human-readable summary
         parts = [f"{name}={avg:.2f}" for name, avg in averages.items()]
