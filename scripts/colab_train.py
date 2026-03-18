@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """Kiki SLM SFT training script for Google Colab.
 
-Loads pre-formatted ChatML data, fine-tunes Qwen3-4B with QLoRA via Unsloth,
-logs to W&B, saves adapter to output directory.
-
-Self-contained — does NOT import from the kiki package.
+All configuration is read from configs/colab_config.yaml.
+CLI args override config values.
 
 Usage:
-    python -u scripts/colab_train.py \
-        --train-file /content/drive/MyDrive/kiki-slm/data/kiki_sft_chatml_train.jsonl \
-        --eval-file /content/drive/MyDrive/kiki-slm/data/kiki_sft_chatml_eval.jsonl \
-        --output-dir /content/drive/MyDrive/kiki-slm/adapters/kiki-sft-v1 \
-        --wandb
+    python -u scripts/colab_train.py
+    python -u scripts/colab_train.py --config configs/colab_config.yaml
+    python -u scripts/colab_train.py --epochs 5 --lr 1e-4  # override config
+    python -u scripts/colab_train.py --dry-run
+    python -u scripts/colab_train.py --resume
 """
 
 from __future__ import annotations
@@ -24,7 +22,6 @@ import time
 from collections import Counter
 from pathlib import Path
 
-# Unbuffered output for real-time tqdm in Colab subprocess
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 import warnings
@@ -34,92 +31,119 @@ import logging
 logging.getLogger("transformers.modeling_attn_mask_utils").setLevel(logging.ERROR)
 
 import torch
+import yaml
 from datasets import load_dataset
 from transformers import TrainerCallback
 
 
 # ---------------------------------------------------------------------------
-# Argument parsing
+# Config loading
 # ---------------------------------------------------------------------------
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Kiki SLM SFT Training")
-    # Data
-    parser.add_argument("--train-file", required=True, help="Path to ChatML train JSONL")
-    parser.add_argument("--eval-file", required=True, help="Path to ChatML eval JSONL")
-    parser.add_argument("--output-dir", required=True, help="Where to save adapter + metrics")
-    # Model
-    parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507", help="HF model ID")
-    parser.add_argument("--max-seq-length", type=int, default=2048)
-    # LoRA
-    parser.add_argument("--lora-r", type=int, default=32)
-    parser.add_argument("--lora-alpha", type=int, default=64)
-    # Training
-    parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--batch-size", type=int, default=None, help="Auto-detect if not set")
-    parser.add_argument("--grad-accum", type=int, default=None, help="Auto-detect if not set")
-    parser.add_argument("--seed", type=int, default=42)
-    # W&B
-    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
-    parser.add_argument("--wandb-project", default="kiki-slm", help="W&B project name")
-    parser.add_argument("--wandb-run-name", default=None, help="W&B run name (auto if not set)")
-    # Resume
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint in output-dir")
-    # Misc
-    parser.add_argument("--dry-run", action="store_true", help="Validate config and exit")
+    parser.add_argument("--config", default="configs/colab_config.yaml", help="Config YAML path")
+    # All overridable from CLI
+    parser.add_argument("--train-file", default=None)
+    parser.add_argument("--eval-file", default=None)
+    parser.add_argument("--output-dir", default=None)
+    parser.add_argument("--base-model", default=None)
+    parser.add_argument("--max-seq-length", type=int, default=None)
+    parser.add_argument("--lora-r", type=int, default=None)
+    parser.add_argument("--lora-alpha", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--grad-accum", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--wandb", action="store_true", default=None)
+    parser.add_argument("--no-wandb", action="store_true")
+    parser.add_argument("--wandb-project", default=None)
+    parser.add_argument("--wandb-run-name", default=None)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
+def merge_config(cfg: dict, args: argparse.Namespace) -> dict:
+    """Merge config file with CLI overrides. CLI wins."""
+    # Flatten config for easy access
+    c = {
+        "train_file": args.train_file or cfg.get("data", {}).get("train_file", ""),
+        "eval_file": args.eval_file or cfg.get("data", {}).get("eval_file", ""),
+        "output_dir": args.output_dir or cfg.get("output", {}).get("adapter_dir", ""),
+        "base_model": args.base_model or cfg.get("model", {}).get("name", "Qwen/Qwen3-4B-Instruct-2507"),
+        "max_seq_length": args.max_seq_length or cfg.get("model", {}).get("max_seq_length", 2048),
+        "load_in_4bit": cfg.get("model", {}).get("load_in_4bit", True),
+        "lora_r": args.lora_r or cfg.get("lora", {}).get("r", 32),
+        "lora_alpha": args.lora_alpha or cfg.get("lora", {}).get("alpha", 64),
+        "lora_dropout": cfg.get("lora", {}).get("dropout", 0),
+        "target_modules": cfg.get("lora", {}).get("target_modules", ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]),
+        "epochs": args.epochs or cfg.get("training", {}).get("epochs", 3),
+        "lr": args.lr or cfg.get("training", {}).get("learning_rate", 2e-4),
+        "lr_scheduler": cfg.get("training", {}).get("lr_scheduler", "cosine"),
+        "warmup_ratio": cfg.get("training", {}).get("warmup_ratio", 0.03),
+        "weight_decay": cfg.get("training", {}).get("weight_decay", 0.01),
+        "packing": cfg.get("training", {}).get("packing", True),
+        "optim": cfg.get("training", {}).get("optim", "adamw_8bit"),
+        "logging_steps": cfg.get("training", {}).get("logging_steps", 10),
+        "save_steps": cfg.get("training", {}).get("save_steps", 500),
+        "save_total_limit": cfg.get("training", {}).get("save_total_limit", 3),
+        "eval_steps": cfg.get("training", {}).get("eval_steps", 500),
+        "seed": args.seed or cfg.get("training", {}).get("seed", 42),
+        "gpu_profiles": cfg.get("training", {}).get("gpu_profiles", {}),
+        "wandb_enabled": (args.wandb if args.wandb is not None else cfg.get("wandb", {}).get("enabled", False)) and not args.no_wandb,
+        "wandb_project": args.wandb_project or cfg.get("wandb", {}).get("project", "kiki-slm"),
+        "wandb_run_name": args.wandb_run_name or cfg.get("wandb", {}).get("run_name"),
+        "resume": args.resume,
+        "dry_run": args.dry_run,
+    }
+    return c
+
+
 # ---------------------------------------------------------------------------
-# GPU auto-detect
+# GPU auto-detect with config profiles
 # ---------------------------------------------------------------------------
 
-def auto_detect_gpu() -> dict:
-    """Auto-detect GPU and return batch_size, grad_accum settings."""
+def auto_detect_gpu(profiles: dict) -> dict:
     if not torch.cuda.is_available():
-        print("  WARNING: No GPU detected, using CPU defaults")
+        print("  WARNING: No GPU detected")
         return {"gpu_name": "CPU", "gpu_mem_gb": 0, "batch_size": 1, "grad_accum": 4}
 
     gpu_name = torch.cuda.get_device_name(0)
     gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
-    if gpu_mem_gb >= 70:  # H100 80GB — max throughput
-        batch_size, grad_accum = 32, 1
-    elif gpu_mem_gb >= 35:  # A100 40/80GB
-        batch_size, grad_accum = 8, 4
-    elif gpu_mem_gb >= 20:  # L4
-        batch_size, grad_accum = 4, 4
-    else:  # T4 or smaller
-        batch_size, grad_accum = 2, 8
+    if gpu_mem_gb >= 70 and "h100" in profiles:
+        p = profiles["h100"]
+    elif gpu_mem_gb >= 35 and "a100" in profiles:
+        p = profiles["a100"]
+    elif gpu_mem_gb >= 20 and "l4" in profiles:
+        p = profiles["l4"]
+    elif "t4" in profiles:
+        p = profiles["t4"]
+    else:
+        p = {"batch_size": 2, "grad_accum": 8}
 
-    return {
-        "gpu_name": gpu_name,
-        "gpu_mem_gb": round(gpu_mem_gb, 1),
-        "batch_size": batch_size,
-        "grad_accum": grad_accum,
-    }
+    return {"gpu_name": gpu_name, "gpu_mem_gb": round(gpu_mem_gb, 1),
+            "batch_size": p.get("batch_size", 2), "grad_accum": p.get("grad_accum", 8)}
 
 
 # ---------------------------------------------------------------------------
-# Chat template helper (self-contained, no kiki package dependency)
+# Chat template helper
 # ---------------------------------------------------------------------------
 
 def apply_chat_template_to_dataset(dataset, tokenizer):
-    """Convert messages column to text column using chat template.
-
-    Sanitizes each message to role+content only to avoid Jinja2 errors
-    from mixed dataset formats (xlam, hermes, arcee).
-    """
     original_template = tokenizer.chat_template
 
     def _apply(examples):
         texts = []
         for msgs in examples["messages"]:
-            clean = [
-                {"role": str(m.get("role", "user")), "content": str(m.get("content") or "")}
-                for m in msgs
-            ]
+            clean = [{"role": str(m.get("role", "user")), "content": str(m.get("content") or "")} for m in msgs]
             try:
                 text = tokenizer.apply_chat_template(clean, tokenize=False, add_generation_prompt=False)
             except Exception:
@@ -138,8 +162,6 @@ def apply_chat_template_to_dataset(dataset, tokenizer):
 # ---------------------------------------------------------------------------
 
 class StepCountCallback(TrainerCallback):
-    """Print correct step count at training start and log progress to stdout."""
-
     def on_train_begin(self, args, state, control, **kwargs):
         print(f"\n{'='*60}")
         print(f"  TRAINING STARTED")
@@ -171,35 +193,20 @@ class StepCountCallback(TrainerCallback):
 # W&B setup
 # ---------------------------------------------------------------------------
 
-def setup_wandb(args, gpu_info: dict, train_size: int, eval_size: int) -> str | None:
-    """Initialize W&B. Returns run URL or None on failure."""
-    if not args.wandb:
+def setup_wandb(c: dict, gpu_info: dict, train_size: int, eval_size: int) -> str | None:
+    if not c["wandb_enabled"]:
         return None
     try:
         import wandb
-
-        run_name = args.wandb_run_name or f"sft-r{args.lora_r}-ep{args.epochs}-{time.strftime('%m%d-%H%M')}"
+        run_name = c["wandb_run_name"] or f"sft-r{c['lora_r']}-ep{c['epochs']}-{time.strftime('%m%d-%H%M')}"
         wandb.init(
-            project=args.wandb_project,
-            name=run_name,
-            config={
-                "base_model": args.base_model,
-                "lora_r": args.lora_r,
-                "lora_alpha": args.lora_alpha,
-                "epochs": args.epochs,
-                "learning_rate": args.lr,
-                "max_seq_length": args.max_seq_length,
-                "batch_size": gpu_info["batch_size"],
-                "grad_accum": gpu_info["grad_accum"],
-                "gpu": gpu_info["gpu_name"],
-                "gpu_mem_gb": gpu_info["gpu_mem_gb"],
-                "train_examples": train_size,
-                "eval_examples": eval_size,
-                "seed": args.seed,
-            },
+            project=c["wandb_project"], name=run_name,
+            config={**c, "gpu": gpu_info["gpu_name"], "gpu_mem_gb": gpu_info["gpu_mem_gb"],
+                    "train_examples": train_size, "eval_examples": eval_size},
         )
-        print(f"  W&B run initialized: {wandb.run.get_url()}")
-        return wandb.run.get_url()
+        url = wandb.run.url
+        print(f"  W&B: {url}")
+        return url
     except Exception as e:
         print(f"  WARNING: W&B init failed ({e}), falling back to file logging")
         return None
@@ -212,77 +219,76 @@ def setup_wandb(args, gpu_info: dict, train_size: int, eval_size: int) -> str | 
 def main():
     args = parse_args()
 
+    # Load config
+    cfg = load_config(args.config) if os.path.exists(args.config) else {}
+    c = merge_config(cfg, args)
+
     print(f"\n{'='*60}")
     print(f"  KIKI SLM — SFT TRAINING")
+    print(f"  Config: {args.config}")
     print(f"{'='*60}")
 
-    # 1. GPU auto-detect
-    gpu_info = auto_detect_gpu()
+    # GPU
+    gpu_info = auto_detect_gpu(c["gpu_profiles"])
     batch_size = args.batch_size or gpu_info["batch_size"]
     grad_accum = args.grad_accum or gpu_info["grad_accum"]
     print(f"\n  GPU: {gpu_info['gpu_name']} ({gpu_info['gpu_mem_gb']}GB)")
     print(f"  Batch: {batch_size} x {grad_accum} grad_accum = {batch_size * grad_accum} effective")
+    print(f"  Model: {c['base_model']}")
+    print(f"  LoRA: r={c['lora_r']}, alpha={c['lora_alpha']}, modules={c['target_modules']}")
+    print(f"  Training: {c['epochs']} epochs, lr={c['lr']}, scheduler={c['lr_scheduler']}")
 
-    # 2. Validate data files
-    for label, path in [("Train", args.train_file), ("Eval", args.eval_file)]:
+    # Validate files
+    for label, path in [("Train", c["train_file"]), ("Eval", c["eval_file"])]:
         if not os.path.exists(path):
             print(f"  ERROR: {label} file not found: {path}")
             sys.exit(1)
-        size_mb = os.path.getsize(path) / 1024 / 1024
-        print(f"  {label}: {path} ({size_mb:.1f}MB)")
+        print(f"  {label}: {path} ({os.path.getsize(path) / 1024 / 1024:.1f}MB)")
 
-    # 3. Load data
+    # Load data
     print("\n  Loading data...")
-    train_dataset = load_dataset("json", data_files=args.train_file, split="train")
-    eval_dataset = load_dataset("json", data_files=args.eval_file, split="train")
+    train_dataset = load_dataset("json", data_files=c["train_file"], split="train")
+    eval_dataset = load_dataset("json", data_files=c["eval_file"], split="train")
     print(f"  Train: {len(train_dataset):,} examples")
     print(f"  Eval:  {len(eval_dataset):,} examples")
 
-    # Source distribution
     if "source" in train_dataset.column_names:
         sources = Counter(train_dataset["source"])
         print(f"\n  Source distribution:")
         for src, cnt in sorted(sources.items(), key=lambda x: -x[1]):
             print(f"    {src:<30s} {cnt:>6,} ({cnt / len(train_dataset) * 100:.1f}%)")
 
-    # 4. Dry run check
-    if args.dry_run:
-        print(f"\n  DRY RUN — config validated, exiting without loading model.")
-        print(f"  Would train {args.epochs} epochs on {len(train_dataset):,} examples")
+    # Dry run
+    if c["dry_run"]:
+        print(f"\n  DRY RUN — config validated, exiting.")
+        print(f"  Would train {c['epochs']} epochs on {len(train_dataset):,} examples")
         return
 
-    # 5. W&B setup
-    wandb_url = setup_wandb(args, gpu_info, len(train_dataset), len(eval_dataset))
+    # W&B
+    wandb_url = setup_wandb(c, gpu_info, len(train_dataset), len(eval_dataset))
     report_to = ["wandb"] if wandb_url else ["none"]
 
-    # 6. Load model
+    # Load model
     from unsloth import FastLanguageModel
 
-    print(f"\n  Loading model: {args.base_model}")
+    print(f"\n  Loading model: {c['base_model']}")
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=args.base_model,
-        max_seq_length=args.max_seq_length,
-        load_in_4bit=True,
-        dtype=None,
+        model_name=c["base_model"], max_seq_length=c["max_seq_length"],
+        load_in_4bit=c["load_in_4bit"], dtype=None,
     )
 
-    # 7. Apply LoRA
-    print(f"  Applying LoRA (r={args.lora_r}, alpha={args.lora_alpha})")
+    # LoRA
+    print(f"  Applying LoRA (r={c['lora_r']}, alpha={c['lora_alpha']})")
     model = FastLanguageModel.get_peft_model(
-        model,
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_dropout=0,
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=args.seed,
+        model, r=c["lora_r"], lora_alpha=c["lora_alpha"],
+        target_modules=c["target_modules"], lora_dropout=c["lora_dropout"],
+        bias="none", use_gradient_checkpointing="unsloth", random_state=c["seed"],
     )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Trainable: {trainable / 1e6:.1f}M / {total_params / 1e6:.1f}M ({trainable / total_params * 100:.2f}%)")
 
-    # 8. Apply chat template
+    # Chat template
     tokenizer.padding_side = "right"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -290,64 +296,44 @@ def main():
     print("\n  Applying chat template...")
     train_dataset, original_template = apply_chat_template_to_dataset(train_dataset, tokenizer)
     eval_dataset, _ = apply_chat_template_to_dataset(eval_dataset, tokenizer)
-
-    # Disable template for training (prevents Jinja2 errors in SFTTrainer)
     tokenizer.chat_template = None
 
-    # 9. Configure trainer
+    # Trainer
     from trl import SFTConfig, SFTTrainer
 
     training_args = SFTConfig(
-        output_dir=args.output_dir,
-        dataset_text_field="text",
-        packing=True,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        num_train_epochs=args.epochs,
-        learning_rate=args.lr,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        bf16=torch.cuda.is_bf16_supported(),
-        fp16=not torch.cuda.is_bf16_supported(),
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        max_seq_length=args.max_seq_length,
-        gradient_checkpointing=True,
-        gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=10,
-        logging_first_step=True,
-        save_strategy="steps",
-        save_steps=500,
-        save_total_limit=3,
-        eval_strategy="steps",
-        eval_steps=500,
-        disable_tqdm=False,
-        report_to=report_to,
-        seed=args.seed,
-        dataloader_pin_memory=True,
+        output_dir=c["output_dir"], dataset_text_field="text", packing=c["packing"],
+        per_device_train_batch_size=batch_size, gradient_accumulation_steps=grad_accum,
+        num_train_epochs=c["epochs"], learning_rate=c["lr"],
+        lr_scheduler_type=c["lr_scheduler"], warmup_ratio=c["warmup_ratio"],
+        bf16=torch.cuda.is_bf16_supported(), fp16=not torch.cuda.is_bf16_supported(),
+        optim=c["optim"], weight_decay=c["weight_decay"], max_seq_length=c["max_seq_length"],
+        gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
+        logging_steps=c["logging_steps"], logging_first_step=True,
+        save_strategy="steps", save_steps=c["save_steps"], save_total_limit=c["save_total_limit"],
+        eval_strategy="steps", eval_steps=c["eval_steps"],
+        disable_tqdm=False, report_to=report_to, seed=c["seed"], dataloader_pin_memory=True,
     )
 
     trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        args=training_args,
-        callbacks=[StepCountCallback()],
+        model=model, tokenizer=tokenizer,
+        train_dataset=train_dataset, eval_dataset=eval_dataset,
+        args=training_args, callbacks=[StepCountCallback()],
     )
 
-    # 10. Train (with optional resume from checkpoint)
+    # Resume
     resume_checkpoint = None
-    if args.resume:
+    if c["resume"]:
         import glob
-        checkpoints = sorted(glob.glob(os.path.join(args.output_dir, "checkpoint-*")))
+        checkpoints = sorted(glob.glob(os.path.join(c["output_dir"], "checkpoint-*")))
         if checkpoints:
             resume_checkpoint = checkpoints[-1]
-            print(f"\n  Resuming from checkpoint: {resume_checkpoint}")
+            print(f"\n  Resuming from: {resume_checkpoint}")
         else:
-            print(f"\n  --resume passed but no checkpoints found in {args.output_dir}, starting fresh")
+            print(f"\n  --resume: no checkpoints found, starting fresh")
 
-    print(f"  GPU memory before training: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
+    # Train
+    print(f"  GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f}GB allocated")
     start_time = time.time()
     result = trainer.train(resume_from_checkpoint=resume_checkpoint)
     elapsed = time.time() - start_time
@@ -364,57 +350,45 @@ def main():
     if wandb_url:
         print(f"  W&B:         {wandb_url}")
 
-    # 11. Eval
+    # Eval
     eval_results = trainer.evaluate()
     print(f"\n  Eval results:")
     for k, v in eval_results.items():
         if isinstance(v, float):
             print(f"    {k}: {v:.4f}")
 
-    # 12. Save adapter
-    os.makedirs(args.output_dir, exist_ok=True)
-    model.save_pretrained(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
+    # Save
+    os.makedirs(c["output_dir"], exist_ok=True)
+    model.save_pretrained(c["output_dir"])
+    tokenizer.save_pretrained(c["output_dir"])
 
-    # 13. Patch chat template back into saved tokenizer_config.json
-    tokenizer_config_path = Path(args.output_dir) / "tokenizer_config.json"
-    if tokenizer_config_path.exists() and original_template:
-        with open(tokenizer_config_path) as f:
-            config = json.load(f)
-        config["chat_template"] = original_template
-        with open(tokenizer_config_path, "w") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-        print(f"  Chat template restored in saved tokenizer_config.json")
+    # Patch chat template
+    tok_config = Path(c["output_dir"]) / "tokenizer_config.json"
+    if tok_config.exists() and original_template:
+        with open(tok_config) as f:
+            tc = json.load(f)
+        tc["chat_template"] = original_template
+        with open(tok_config, "w") as f:
+            json.dump(tc, f, indent=2, ensure_ascii=False)
+        print(f"  Chat template restored in tokenizer_config.json")
 
-    # 14. Save training metrics
+    # Metrics
     metrics = {
-        "model": args.base_model,
-        "lora_r": args.lora_r,
-        "lora_alpha": args.lora_alpha,
-        "train_examples": len(train_dataset),
-        "eval_examples": len(eval_dataset),
-        "epochs": args.epochs,
-        "learning_rate": args.lr,
-        "final_loss": final_loss,
-        "eval_results": eval_results,
-        "duration_hours": round(elapsed / 3600, 2),
-        "gpu": gpu_info["gpu_name"],
-        "peak_vram_gb": round(peak_vram, 2),
-        "wandb_url": wandb_url,
-        "seed": args.seed,
+        "config": c, "final_loss": final_loss, "eval_results": eval_results,
+        "duration_hours": round(elapsed / 3600, 2), "gpu": gpu_info["gpu_name"],
+        "peak_vram_gb": round(peak_vram, 2), "wandb_url": wandb_url,
+        "train_examples": len(train_dataset), "eval_examples": len(eval_dataset),
     }
-    metrics_path = Path(args.output_dir) / "training_metrics.json"
+    metrics_path = Path(c["output_dir"]) / "training_metrics.json"
     with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, default=str)
 
-    print(f"\n  Adapter saved to: {args.output_dir}")
-    print(f"  Metrics saved to: {metrics_path}")
+    print(f"\n  Adapter: {c['output_dir']}")
+    print(f"  Metrics: {metrics_path}")
 
-    # 15. Finish W&B
     if wandb_url:
         try:
             import wandb
-
             wandb.log({"peak_vram_gb": peak_vram})
             wandb.finish()
         except Exception:

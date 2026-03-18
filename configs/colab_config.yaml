@@ -1,0 +1,132 @@
+# ============================================================
+# KIKI SLM — SINGLE SOURCE OF TRUTH FOR ALL TRAINING & EVAL
+# ============================================================
+# All scripts (colab_train.py, colab_eval.py, prepare_sft_chatml.py)
+# read from this file. Change settings HERE, not in scripts.
+# ============================================================
+
+# --- Model ---
+model:
+  name: Qwen/Qwen3-4B-Instruct-2507
+  max_seq_length: 2048
+  load_in_4bit: true
+
+# --- LoRA ---
+lora:
+  r: 32
+  alpha: 64
+  dropout: 0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+# --- Training ---
+training:
+  epochs: 3
+  learning_rate: 2.0e-4
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  weight_decay: 0.01
+  packing: true
+  optim: adamw_8bit
+  logging_steps: 10
+  save_steps: 500
+  save_total_limit: 3
+  eval_steps: 500
+  seed: 42
+
+  # GPU-specific batch sizes (auto-selected based on VRAM)
+  gpu_profiles:
+    h100:  # >= 70GB
+      batch_size: 32
+      grad_accum: 1
+    a100:  # >= 35GB
+      batch_size: 8
+      grad_accum: 4
+    l4:    # >= 20GB
+      batch_size: 4
+      grad_accum: 4
+    t4:    # < 20GB
+      batch_size: 2
+      grad_accum: 8
+
+# --- Data ---
+data:
+  train_file: /content/drive/MyDrive/kiki-slm/data/kiki_sft_chatml_train.jsonl
+  eval_file: /content/drive/MyDrive/kiki-slm/data/kiki_sft_chatml_eval.jsonl
+  gold_file: /content/drive/MyDrive/kiki-slm/data/gold_100.jsonl
+
+# --- Output ---
+output:
+  adapter_dir: /content/drive/MyDrive/kiki-slm/adapters/kiki-sft-v1
+
+# --- Eval ---
+eval:
+  # Auto-detected from GPU, or override here
+  batch_size: 0  # 0 = auto-detect
+  max_new_tokens: 512
+  temperature: 0.1
+
+# --- W&B ---
+wandb:
+  enabled: true
+  project: kiki-slm
+  # run_name auto-generated if not set
+  # run_name: my-custom-run-name
+
+# --- Data Preparation (used by prepare_sft_chatml.py) ---
+data_prep:
+  total_examples: 100000  # set to 0 for --use-all
+  eval_ratio: 0.10
+  seed: 42
+  output_dir: data/formatted
+
+  datasets:
+    bitext_cs:
+      hf_id: bitext/Bitext-customer-support-llm-chatbot-training-dataset
+      converter: bitext
+      weight: 0.20
+    bitext_ecom:
+      hf_id: bitext/Bitext-retail-ecommerce-llm-chatbot-training-dataset
+      converter: bitext
+      weight: 0.20
+    customer_support_tickets:
+      hf_id: Tobi-Bueck/customer-support-tickets
+      converter: ticket
+      weight: 0.15
+      filter_language: en
+    bitext_banking:
+      hf_id: bitext/Bitext-retail-banking-llm-chatbot-training-dataset
+      converter: bitext
+      weight: 0.05
+    bitext_insurance:
+      hf_id: bitext/Bitext-insurance-llm-chatbot-training-dataset
+      converter: bitext
+      weight: 0.05
+    banking77:
+      hf_id: legacy-datasets/banking77
+      converter: banking77
+      weight: 0.05
+    clinc_oos:
+      hf_id: clinc/clinc_oos
+      subset: plus
+      converter: clinc
+      weight: 0.02
+      filter_clinc_cs_only: true
+    arcee_agent:
+      hf_id: arcee-ai/agent-data
+      converter: arcee_agent
+      weight: 0.15
+    xlam_60k:
+      hf_id: Salesforce/xlam-function-calling-60k
+      converter: xlam
+      weight: 0.08
+    hermes_fc:
+      hf_id: NousResearch/hermes-function-calling-v1
+      converter: hermes
+      weight: 0.05

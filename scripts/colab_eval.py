@@ -39,15 +39,42 @@ import torch
 # Args
 # ---------------------------------------------------------------------------
 
+def load_config(path: str) -> dict:
+    if os.path.exists(path):
+        import yaml
+        with open(path) as f:
+            return yaml.safe_load(f)
+    return {}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Kiki SLM Base vs Fine-tuned Evaluation")
-    parser.add_argument("--adapter-path", required=True, help="Path to fine-tuned LoRA adapter")
-    parser.add_argument("--base-model", default="Qwen/Qwen3-4B-Instruct-2507", help="Base model ID")
-    parser.add_argument("--gold-file", required=True, help="Path to gold JSONL")
-    parser.add_argument("--output-file", default=None, help="Where to save results JSON")
-    parser.add_argument("--max-seq-length", type=int, default=2048)
-    parser.add_argument("--batch-size", type=int, default=0, help="Batch size for inference (0=auto-detect)")
-    return parser.parse_args()
+    parser.add_argument("--config", default="configs/colab_config.yaml", help="Config YAML path")
+    # CLI overrides
+    parser.add_argument("--adapter-path", default=None)
+    parser.add_argument("--base-model", default=None)
+    parser.add_argument("--gold-file", default=None)
+    parser.add_argument("--output-file", default=None)
+    parser.add_argument("--max-seq-length", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+
+    args = parser.parse_args()
+
+    # Merge with config file
+    cfg = load_config(args.config)
+    args.adapter_path = args.adapter_path or cfg.get("output", {}).get("adapter_dir", "")
+    args.base_model = args.base_model or cfg.get("model", {}).get("name", "Qwen/Qwen3-4B-Instruct-2507")
+    args.gold_file = args.gold_file or cfg.get("data", {}).get("gold_file", "")
+    args.max_seq_length = args.max_seq_length or cfg.get("model", {}).get("max_seq_length", 2048)
+    args.batch_size = args.batch_size or cfg.get("eval", {}).get("batch_size", 0)
+
+    # Require adapter-path and gold-file
+    if not args.adapter_path:
+        parser.error("--adapter-path is required (or set output.adapter_dir in config)")
+    if not args.gold_file:
+        parser.error("--gold-file is required (or set data.gold_file in config)")
+
+    return args
 
 
 # ---------------------------------------------------------------------------
