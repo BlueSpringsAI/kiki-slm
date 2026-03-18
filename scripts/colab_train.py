@@ -85,7 +85,7 @@ def auto_detect_gpu() -> dict:
     gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
 
     if gpu_mem_gb >= 70:  # H100 80GB — max throughput
-        batch_size, grad_accum = 16, 2
+        batch_size, grad_accum = 32, 1
     elif gpu_mem_gb >= 35:  # A100 40/80GB
         batch_size, grad_accum = 8, 4
     elif gpu_mem_gb >= 20:  # L4
