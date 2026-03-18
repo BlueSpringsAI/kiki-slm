@@ -205,9 +205,42 @@ def evaluate_model(model, tokenizer, tickets: list[dict], label: str, batch_size
 # Metrics
 # ---------------------------------------------------------------------------
 
+def workflow_step_overlap(pred_steps: list[str], gold_steps: list[str]) -> float:
+    """Compute normalized overlap between predicted and gold workflow steps.
+
+    Uses set-based Jaccard similarity on lowercased step names.
+    Returns 0.0-1.0 where 1.0 = perfect match.
+    """
+    if not gold_steps and not pred_steps:
+        return 1.0
+    if not gold_steps or not pred_steps:
+        return 0.0
+    pred_set = {s.strip().lower() for s in pred_steps}
+    gold_set = {s.strip().lower() for s in gold_steps}
+    intersection = pred_set & gold_set
+    union = pred_set | gold_set
+    return len(intersection) / len(union) if union else 0.0
+
+
+def tool_set_f1(pred_tools: list[str], gold_tools: list[str]) -> float:
+    """Compute F1 between predicted and gold tool sets."""
+    if not gold_tools and not pred_tools:
+        return 1.0
+    if not gold_tools or not pred_tools:
+        return 0.0
+    pred_set = {t.strip().lower() for t in pred_tools}
+    gold_set = {t.strip().lower() for t in gold_tools}
+    tp = len(pred_set & gold_set)
+    precision = tp / len(pred_set) if pred_set else 0.0
+    recall = tp / len(gold_set) if gold_set else 0.0
+    return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+
 def compute_metrics(results: list[dict], tickets: list[dict]) -> dict:
     n = len(results)
     intent_correct = urgency_correct = json_valid = 0
+    workflow_scores = []
+    tool_scores = []
     latencies = []
 
     for res, ticket in zip(results, tickets):
@@ -215,20 +248,36 @@ def compute_metrics(results: list[dict], tickets: list[dict]) -> dict:
         latencies.append(res["latency"])
         if p is not None:
             json_valid += 1
+            # Intent (with secondary)
             pred_intent = p.get("intent", "").lower()
             gold_intent = ticket.get("gold_intent", "").lower()
             gold_secondary = ticket.get("gold_intent_secondary", "").lower()
             if pred_intent == gold_intent or (gold_secondary and pred_intent == gold_secondary):
                 intent_correct += 1
+            # Urgency
             if p.get("urgency", "").lower() == ticket.get("gold_urgency", "").lower():
                 urgency_correct += 1
+            # Workflow steps
+            gold_steps = ticket.get("gold_workflow_steps", [])
+            pred_steps = p.get("workflow_steps", [])
+            if gold_steps:
+                workflow_scores.append(workflow_step_overlap(pred_steps, gold_steps))
+            # Tool selection
+            gold_tools = ticket.get("gold_tools_required", [])
+            pred_tools = p.get("tools_required", [])
+            if gold_tools:
+                tool_scores.append(tool_set_f1(pred_tools, gold_tools))
 
     return {
         "intent_accuracy": intent_correct / n if n else 0,
         "urgency_accuracy": urgency_correct / n if n else 0,
+        "workflow_accuracy": sum(workflow_scores) / len(workflow_scores) if workflow_scores else 0,
+        "tool_f1": sum(tool_scores) / len(tool_scores) if tool_scores else 0,
         "json_parse_rate": json_valid / n if n else 0,
         "avg_latency_s": sum(latencies) / len(latencies) if latencies else 0,
         "total": n,
+        "workflow_evaluated": len(workflow_scores),
+        "tools_evaluated": len(tool_scores),
     }
 
 
@@ -259,17 +308,20 @@ def print_comparison(base_metrics: dict, ft_metrics: dict, base_results: list, f
     for key, label, fmt in [
         ("intent_accuracy", "Intent Accuracy", "{:.1%}"),
         ("urgency_accuracy", "Urgency Accuracy", "{:.1%}"),
+        ("workflow_accuracy", "Workflow Accuracy", "{:.1%}"),
+        ("tool_f1", "Tool Selection F1", "{:.1%}"),
         ("json_parse_rate", "JSON Parse Rate", "{:.1%}"),
         ("avg_latency_s", "Avg Latency (s)", "{:.2f}"),
     ]:
-        bv = fmt.format(base_metrics[key])
-        fv = fmt.format(ft_metrics[key])
+        bv = fmt.format(base_metrics.get(key, 0))
+        fv = fmt.format(ft_metrics.get(key, 0))
         print(f"  {label:<28s} {bv:>15s} {fv:>15s}")
 
     print(f"{'='*65}")
 
-    for key, label in [("intent_accuracy", "Intent"), ("urgency_accuracy", "Urgency"), ("json_parse_rate", "JSON Parse")]:
-        diff = ft_metrics[key] - base_metrics[key]
+    for key, label in [("intent_accuracy", "Intent"), ("urgency_accuracy", "Urgency"),
+                        ("workflow_accuracy", "Workflow"), ("tool_f1", "Tool F1"), ("json_parse_rate", "JSON Parse")]:
+        diff = ft_metrics.get(key, 0) - base_metrics.get(key, 0)
         arrow = "+" if diff >= 0 else ""
         print(f"  {label} improvement: {arrow}{diff:.1%}")
 
