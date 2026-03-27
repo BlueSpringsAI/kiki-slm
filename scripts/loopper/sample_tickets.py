@@ -26,9 +26,11 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Default paths ─────────────────────────────────────────────
-FILTERED_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/filtered"
-OUTPUT_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/sampled"
+# ── Default paths (from configs/loopper_pipeline.yaml or project-relative) ──
+from scripts.loopper.config import get_default_paths as _get_paths
+_PATHS = _get_paths()
+FILTERED_DIR = _PATHS["filtered_tickets"]
+OUTPUT_DIR = _PATHS["sampled_tickets"]
 
 # ── English-only filter ───────────────────────────────────────
 # Include tickets detected as English OR with no language detected

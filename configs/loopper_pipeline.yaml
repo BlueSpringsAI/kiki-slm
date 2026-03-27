@@ -1,0 +1,244 @@
+# ============================================================
+# LOOPPER ORGANIC DATA PIPELINE — SINGLE SOURCE OF TRUTH
+# ============================================================
+# All pipeline scripts read from this file.
+# Change settings HERE, not in scripts.
+# ============================================================
+
+# --- Paths ---
+paths:
+  filtered_tickets: /Users/sriranga/Desktop/kiki-train/data/filtered_tickets
+  sampled_tickets: /Users/sriranga/Desktop/kiki-train/data/sampled_tickets
+  traces: /Users/sriranga/Desktop/kiki-train/data/traces
+  chatml_output: /Users/sriranga/Desktop/kiki-train/data/chatml
+  agent_src: null  # Path to Looper-Support-Agent-Server/src (null = skip agent import)
+
+# --- Step 2: Sampling ---
+sampling:
+  n_tickets: 5000
+  seed: 42
+  english_only: true
+  english_languages: ["en", null, "none", ""]
+
+  truncation:
+    description_chars: 4000
+    conversation_chars: 3000
+
+  depth_targets:
+    single_turn: 0.35
+    customer_reply: 0.05
+    with_agent: 0.30
+    multi_turn: 0.20
+    deep_thread: 0.10
+
+  sentiment_targets:
+    negative: 0.20
+    neutral: 0.40
+    positive: 0.40
+
+  category_proxy_targets:
+    reply: 0.30
+    eproof: 0.10
+    tracking: 0.10
+    attachment: 0.05
+    promo: 0.05
+    none: 0.40
+
+# --- Step 3: Trace Generation ---
+tracing:
+  concurrency: 3
+  batch_size: 50
+  cost_per_ticket_estimate: 0.03
+  max_conversations: 8
+
+  agent:
+    enable_human_review: false
+    log_level: WARNING
+    audit_log_level: WARNING
+
+# --- Step 4: ChatML Conversion ---
+chatml:
+  correction_ratio: 0.05
+  empty_rag_ratio: 0.08
+  eval_split: 0.10
+  seed: 42
+
+  system_prompt: |
+    You are a Loopper support agent — a warm, proactive customer-service assistant for Loopper, a B2B promotional-products company headquartered in Amsterdam that has served businesses across Europe for 24+ years.
+
+    IMPORTANT RULES:
+    1. ALWAYS search the knowledge base before answering — ground every claim in retrieved facts.
+    2. If the KB returns nothing relevant, say so honestly and offer to escalate.
+    3. Never fabricate product details, prices, timelines, or policies.
+    4. Sign off responses professionally.
+    5. Respond in the customer's language.
+
+  rag_tool:
+    name: rag_search
+    description: "Search Loopper's knowledge base for relevant information."
+    collections:
+      - faq
+      - operations
+      - communication_guidelines
+      - supplier_data
+    default_top_k: 5
+
+  # Category-specific KB search plans
+  category_search_plans:
+    new_order_inquiry:
+      - "Ordering process, pricing, customization options, MOQ (faq)"
+      - "Lead times, production schedules (operations)"
+      - "Communication templates for new orders (communication_guidelines)"
+    quality_complaint:
+      - "Quality complaint handling, replacement/refund conditions (faq)"
+      - "Quality inspection process, defect reporting (operations)"
+      - "Complaint response templates (communication_guidelines)"
+    delivery_issue:
+      - "Delivery timelines, tracking, delay handling (faq)"
+      - "Shipping partners, logistics procedures (operations)"
+      - "Delivery update templates (communication_guidelines)"
+    design_update:
+      - "Design process, proof approval, revision policy (faq)"
+      - "Design team procedures, file formats (operations)"
+    pricing_request:
+      - "Pricing structure, volume discounts, quote process (faq)"
+      - "Supplier pricing, margin guidelines (supplier_data)"
+    reorder:
+      - "Reorder process, repeat order discounts (faq)"
+      - "Previous order lookup procedures (operations)"
+    account_inquiry:
+      - "Account management, payment terms, credit (faq)"
+      - "Account update procedures (operations)"
+    sample_request:
+      - "Sample availability, costs, turnaround (faq)"
+      - "Sample fulfillment process (operations)"
+    general_support:
+      - "General FAQ, company policies (faq)"
+      - "Escalation procedures (operations)"
+    other:
+      - "General FAQ (faq)"
+      - "Company policies and procedures (operations)"
+
+  # Degraded responses for correction examples
+  degraded_responses:
+    - "Thank you for reaching out. Your refund will be issued within 3-5 business days."
+    - "I've processed your request. You should receive a confirmation email shortly."
+    - "Based on our records, your order is on track for delivery next week."
+
+  # Correction feedback messages
+  correction_messages:
+    - "That's not right. You didn't search the knowledge base. Please search for relevant information before answering."
+    - "Wrong answer. You need to use the rag_search tool to find the correct information first."
+    - "Incorrect. Always ground your response in knowledge base results. Search first, then answer."
+
+  # Think block variations
+  think_openers:
+    - "Let me analyze this customer request carefully."
+    - "I need to understand what the customer is asking."
+    - "Let me break down this support ticket."
+    - "I'll analyze this message step by step."
+    - "Let me think about what the customer needs."
+
+  search_plan_intros:
+    - "I should search the knowledge base for:"
+    - "To answer properly, I need to find:"
+    - "Let me check the KB for relevant information:"
+    - "I'll search for the following to help this customer:"
+
+  guardrail_sets:
+    - - "I must ground my response in the KB results."
+      - "I should not fabricate any details."
+      - "I'll sign off professionally."
+    - - "Every claim must be backed by retrieved facts."
+      - "If information is missing, I'll be transparent."
+      - "I'll maintain Loopper's professional tone."
+    - - "I need to verify my answer against the KB."
+      - "No hallucination — only facts from search results."
+      - "Professional sign-off required."
+
+  # Empty RAG fallback responses by category
+  empty_rag_fallbacks:
+    quality_complaint: "I'll need to check with our quality team on this specific issue."
+    delivery_issue: "Let me check with our logistics team for the latest update."
+    pricing_request: "I'll need to verify the current pricing with our team."
+    default: "I'll need to check with the relevant team and get back to you."
+
+# --- Step 5: Validation ---
+validation:
+  max_seq_length: 4096
+  strict: false
+
+  valid_intents:
+    - new_order_inquiry
+    - quality_complaint
+    - delivery_issue
+    - design_update
+    - pricing_request
+    - reorder
+    - account_inquiry
+    - sample_request
+    - general_support
+    - other
+    - spam
+    - misdirected
+    - newsletter
+    - auto_reply
+    - unrelated
+    - system_notification
+    - acknowledgment
+
+  valid_urgencies: [low, medium, high, critical]
+
+  valid_resolution_types:
+    - direct_resolve
+    - requires_human_action
+    - needs_escalation
+    - needs_more_info
+
+  valid_teams:
+    - design
+    - logistics
+    - finance
+    - account_manager
+    - none
+
+  rejection_intents:
+    - spam
+    - misdirected
+    - newsletter
+    - auto_reply
+    - unrelated
+    - system_notification
+
+  required_output_fields:
+    - summary
+    - resolution_type
+    - human_team_required
+    - action_list
+    - is_valid
+    - response_english
+    - category
+    - category_confidence
+    - urgency
+    - action_reasoning
+    - resolution_reasoning
+
+  banned_response_phrases:
+    - "en tant qu"
+    - "je suis"
+    - "als ki"
+    - "as an ai"
+    - "i don't have access to"
+    - "ich bin ein"
+    - "je ne peux"
+    - "i cannot"
+    - "i'm unable to"
+
+  thresholds:
+    min_think_block_chars: 30
+    min_query_chars: 3
+    min_response_chars: 20
+    min_category_examples: 5
+    max_category_pct: 0.40
+    token_chars_ratio: 3.5  # 1 token per 3.5 chars (estimate)
+    duplicate_threshold: 2  # flag if ticket appears > N times

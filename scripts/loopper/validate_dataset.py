@@ -36,8 +36,10 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Default paths ─────────────────────────────────────────────
-CHATML_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/chatml"
+# ── Default path (from configs/loopper_pipeline.yaml or project-relative) ──
+from scripts.loopper.config import get_default_paths as _get_paths
+_PATHS = _get_paths()
+CHATML_DIR = _PATHS["chatml_output"]
 
 # ── Valid values ──────────────────────────────────────────────
 VALID_INTENTS = {

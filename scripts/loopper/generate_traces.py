@@ -34,12 +34,12 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Default paths ─────────────────────────────────────────────
-SAMPLED_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/sampled"
-TRACES_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/traces"
-
-# ── Agent import ──────────────────────────────────────────────
-AGENT_SRC = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/Looper-Support-Agent-Server"
+# ── Default paths (from configs/loopper_pipeline.yaml or project-relative) ──
+from scripts.loopper.config import get_default_paths as _get_paths
+_PATHS = _get_paths()
+SAMPLED_DIR = _PATHS["sampled_tickets"]
+TRACES_DIR = _PATHS["traces"]
+AGENT_SRC = _PATHS["agent_src"] or ""
 
 
 def setup_agent_path():

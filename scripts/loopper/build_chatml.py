@@ -35,9 +35,11 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── Default paths ─────────────────────────────────────────────
-TRACES_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/traces"
-OUTPUT_DIR = "/Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/chatml"
+# ── Default paths (from configs/loopper_pipeline.yaml or project-relative) ──
+from scripts.loopper.config import get_default_paths as _get_paths
+_PATHS = _get_paths()
+TRACES_DIR = _PATHS["traces"]
+OUTPUT_DIR = _PATHS["chatml_output"]
 
 # ── Formal tool definition (for Qwen 3.5 tool calling) ────────
 RAG_SEARCH_TOOL = {
