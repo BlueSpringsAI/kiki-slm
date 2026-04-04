@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Step 4: Transform agent traces into ChatML training data with <think> blocks.
+"""Step 4: Transform agent traces into ChatML training data for Qwen 3.5 9B.
 
-Reads trace JSONs from data/traces/, synthesizes reasoning chains from the agent's
-structured outputs, and produces ChatML JSONL ready for Qwen 3.5 4B QLoRA fine-tuning.
+Uses Qwen's official format:
+  - reasoning goes in `reasoning_content` field (separate from `content`)
+  - tool calls use `tool_calls` field with id linkage
+  - tool definitions in top-level `tools` field
+  - final response in `content` as JSON
 
-IMPORTANT: This script produces tool calls using Qwen 3.5's native format.
-The tool_calls and tool responses include id/tool_call_id fields required by
-Qwen's chat template. Tool definitions are included in the messages as a
-separate tools field for apply_chat_template().
+This avoids the confirmed <think> + tool_call leakage bug on Qwen 3.5 small models
+by keeping reasoning in its own field rather than mixing it into content.
 
 Generates:
   - data/chatml/train.jsonl  (90%)
@@ -41,7 +42,7 @@ _PATHS = _get_paths()
 TRACES_DIR = _PATHS["traces"]
 OUTPUT_DIR = _PATHS["chatml_output"]
 
-# ── Formal tool definition (for Qwen 3.5 tool calling) ────────
+# ── Formal tool definition ────────────────────────────────────
 RAG_SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -76,7 +77,7 @@ You are a Loopper support agent for B2B promotional products (mugs, pens, bags, 
 t-shirts, caps, water bottles, notebooks, lanyards, USB sticks, power banks, etc.). \
 Headquartered in Amsterdam, serving Europe for 24+ years. 6,000+ customizable products.
 
-You MUST think step by step in <think> blocks before every action.
+You MUST reason before every action and before your final response.
 You MUST call rag_search at least once before generating your final response \
 (exception: simple acknowledgments like "OK thank you" that need no context).
 You MUST ground your response in retrieved context — never invent policies, \
@@ -91,9 +92,9 @@ Output your final response as a single JSON object with these fields:
 intent, urgency, confidence, is_valid, rejection_type, resolution_type, team, \
 actions, summary, reasoning, response"""
 
-# ── Think block variation templates ───────────────────────────
+# ── Reasoning variation templates ─────────────────────────────
 
-THINK_OPENERS = [
+REASONING_OPENERS = [
     "Let me analyze this ticket.",
     "Looking at this ticket carefully.",
     "Let me break down what the customer is asking.",
@@ -110,31 +111,15 @@ SEARCH_PLAN_INTROS = [
 ]
 
 GUARDRAIL_VARIATIONS = [
-    [
-        "Before responding, let me check my guardrails:",
-        "- I can only use information from the retrieved context",
-        "- I must not promise timelines unless the policy specifies them",
-        "- I cannot confirm actions — only the human reviewer can execute",
-    ],
-    [
-        "Checking what I can and cannot say:",
-        "- Only facts from the KB, nothing invented",
-        "- No specific dates or prices unless from the policy",
-        "- I draft the response, I don't execute actions",
-    ],
-    [
-        "Important constraints for this response:",
-        "- Ground everything in retrieved context",
-        "- Don't over-promise on timelines",
-        "- Flag anything I'm uncertain about for human review",
-    ],
+    "I can only use information from retrieved context. No invented timelines or prices. I draft, the human reviewer executes.",
+    "Only facts from the KB. No specific dates or prices unless from policy. I draft the response, I don't execute actions.",
+    "Ground everything in retrieved context. Don't over-promise on timelines. Flag anything uncertain for human review.",
 ]
 
 # ── Category search plans ─────────────────────────────────────
 CATEGORY_SEARCH_PLANS = {
     "new_order_inquiry": [
         "Ordering process, pricing, customization options, MOQ (faq)",
-        "Payment methods, checkout process (faq)",
         "Welcoming, sales-oriented response tone (communication_guidelines)",
     ],
     "quality_complaint": [
@@ -149,11 +134,9 @@ CATEGORY_SEARCH_PLANS = {
     "refund_request": [
         "Refund conditions, timelines, eligibility (faq)",
         "Refund workflow, finance team handoff (operations)",
-        "Empathetic response tone (communication_guidelines)",
     ],
     "order_cancellation": [
         "Cancellation conditions, retention strategies (faq)",
-        "Cancellation workflow, alternative offering (operations)",
         "Understanding, retention-focused response tone (communication_guidelines)",
     ],
     "design_update": [
@@ -167,7 +150,6 @@ CATEGORY_SEARCH_PLANS = {
     "sample_request": [
         "Sample pricing, blank vs printed, transport costs (faq)",
         "Digital mockup alternative (faq)",
-        "Helpful sales response tone (communication_guidelines)",
     ],
     "price_negotiation": [
         "Price matching, competitor handling (faq)",
@@ -205,129 +187,101 @@ def _tool_call_id() -> str:
     return f"call_{uuid.uuid4().hex[:12]}"
 
 
-def synthesize_think_block_1(triage: dict) -> str:
-    """Synthesize the first <think> block from triage output."""
+def synthesize_reasoning_1(triage: dict) -> str:
+    """Synthesize reasoning for the first assistant turn (before first tool call).
+
+    Goes in the `reasoning_content` field, NOT in `content`.
+    Keep it concise: 50-150 tokens. The model should reason, not ramble.
+    """
     cr = triage.get("category_reasoning") or {}
     vr = triage.get("validation_reasoning") or {}
     category = triage.get("category", "other")
     confidence = triage.get("category_confidence", 0.0)
 
-    lines = ["<think>"]
-    lines.append(random.choice(THINK_OPENERS))
-    lines.append("")
+    lines = [random.choice(REASONING_OPENERS)]
 
-    # Intent analysis with deliberation
     primary_intent = cr.get("primary_intent", "")
     reasoning_summary = cr.get("reasoning_summary", "")
     key_indicators = cr.get("key_indicators", [])
 
     if primary_intent:
-        lines.append(f"The customer's primary intent is: {primary_intent}")
+        lines.append(f"Primary intent: {primary_intent}")
     if key_indicators:
         lines.append(f"Key signals: {', '.join(str(k) for k in key_indicators)}")
     if reasoning_summary:
-        lines.append(f"\n{reasoning_summary}")
+        lines.append(reasoning_summary)
 
-    # Add deliberation for ambiguous cases
     if confidence < 0.8:
-        lines.append(f"\nConfidence is {confidence:.0%} — this could also be interpreted differently, "
-                      f"but {category.replace('_', ' ')} fits best based on the primary request.")
+        lines.append(f"Confidence {confidence:.0%} — ambiguous, but {category.replace('_', ' ')} fits best.")
 
-    # Validation reasoning
     val_reasoning = vr.get("reasoning", "")
     if val_reasoning:
-        lines.append(f"\nTriage assessment: {val_reasoning}")
+        lines.append(f"Triage: {val_reasoning}")
 
-    # Search plan with rationale
     search_plan = CATEGORY_SEARCH_PLANS.get(category, DEFAULT_SEARCH_PLAN)
-    lines.append(f"\n{random.choice(SEARCH_PLAN_INTROS)}")
-    for i, plan in enumerate(search_plan, 1):
-        lines.append(f"{i}. {plan}")
+    lines.append(random.choice(SEARCH_PLAN_INTROS))
+    for plan in search_plan:
+        lines.append(f"- {plan}")
 
-    lines.append("</think>")
     return "\n".join(lines)
 
 
-def synthesize_think_between(tool_call: dict, prev_results: list) -> str:
-    """Synthesize a <think> block between tool calls that analyzes previous results."""
+def synthesize_reasoning_between(tool_call: dict, prev_results: list) -> str:
+    """Synthesize reasoning between tool calls. Concise: 30-80 tokens."""
     query = tool_call.get("query", "")
     collection = tool_call.get("collection", "")
 
-    lines = ["<think>"]
-
+    lines = []
     if prev_results:
         high_rel = [r for r in prev_results if r.get("rerank_score", 0) > 0.5]
         if high_rel:
-            lines.append(f"The previous search returned {len(high_rel)} relevant result(s).")
-            # Summarize what was found
-            for r in high_rel[:2]:
-                source = r.get("source", "unknown")
-                text = r.get("text", "")[:100]
-                lines.append(f"- [{source}]: {text}...")
-            lines.append(f"\nThis gives me the policy context. Now I also need tone guidance "
-                          f"for this type of response.")
+            lines.append(f"Found {len(high_rel)} relevant result(s). Got the policy context.")
+            lines.append(f"Now need tone guidance from {collection}.")
         else:
-            lines.append("The previous search returned results but none were highly relevant. "
-                          "I'll proceed with what I have and supplement with additional context.")
+            lines.append("Previous search had weak results. Supplementing with additional context.")
     else:
-        lines.append("No results from previous search were available.")
+        lines.append("No prior results available.")
 
-    lines.append(f"\nSearching {collection} for: {query}")
-    lines.append("</think>")
+    lines.append(f"Searching {collection}: {query}")
     return "\n".join(lines)
 
 
-def synthesize_think_block_2(response: dict, tool_results: list, category: str) -> str:
-    """Synthesize the final <think> block from response output."""
+def synthesize_reasoning_final(response: dict, tool_results: list) -> str:
+    """Synthesize reasoning for the final assistant turn (before JSON output).
+
+    Concise: 50-120 tokens. Summarize findings, state resolution, check guardrails.
+    """
     ar = response.get("action_reasoning") or {}
     rr = response.get("resolution_reasoning") or {}
 
-    lines = ["<think>"]
+    lines = []
 
-    # Summarize what was retrieved
     high_relevance = [r for r in tool_results if r.get("rerank_score", 0) > 0.5]
     if high_relevance:
-        lines.append("From the search results I found:")
-        for r in high_relevance[:4]:
+        lines.append("Retrieved context:")
+        for r in high_relevance[:3]:
             source = r.get("source", "unknown")
-            text = r.get("text", "")[:120]
+            text = r.get("text", "")[:80]
             lines.append(f"- [{source}]: {text}...")
     elif tool_results:
-        lines.append("Search results were available but none scored as highly relevant. "
-                      "I should be cautious and escalate rather than guess at policies.")
+        lines.append("Search results were weak. Being cautious — escalating rather than guessing.")
     else:
-        lines.append("No relevant results were found. I should acknowledge the gap "
-                      "and let the human reviewer handle this with full context.")
+        lines.append("No results found. Acknowledging the gap, escalating to human reviewer.")
 
-    # Resolution reasoning
     why_resolution = rr.get("why_resolution_type", "")
     if why_resolution:
-        lines.append(f"\nResolution decision: {why_resolution}")
+        lines.append(f"Resolution: {why_resolution}")
 
-    escalation_risk = rr.get("escalation_risk", "")
-    if escalation_risk:
-        lines.append(f"Escalation risk: {escalation_risk}")
-
-    # Action reasoning
     why_actions = ar.get("why_these_actions", "")
     if why_actions:
-        lines.append(f"\nActions for reviewer: {why_actions}")
+        lines.append(f"Actions: {why_actions}")
 
     policy_basis = ar.get("policy_basis", "")
     if policy_basis:
-        lines.append(f"Policy basis: {policy_basis}")
+        lines.append(f"Policy: {policy_basis}")
 
-    urgency = ar.get("urgency_level", "")
-    if urgency:
-        lines.append(f"Urgency: {urgency}")
+    lines.append(random.choice(GUARDRAIL_VARIATIONS))
 
-    # Context-dependent guardrails (varied per example)
-    guardrail = random.choice(GUARDRAIL_VARIATIONS)
-    lines.append("")
-    for line in guardrail:
-        lines.append(line)
-
-    lines.append("</think>")
     return "\n".join(lines)
 
 
@@ -385,7 +339,10 @@ def format_ticket_text(input_state: dict) -> str:
 def trace_to_chatml(trace: dict) -> dict | None:
     """Convert a single agent trace into a ChatML training example.
 
-    Uses Qwen 3.5's native tool calling format with tool_call_id linkage.
+    Uses Qwen 3.5's official format:
+    - reasoning_content field for reasoning (separate from content)
+    - tool_calls field with id linkage
+    - content field for final JSON output only
     """
     triage = trace.get("triage", {})
     retrieval = trace.get("retrieval", {})
@@ -403,18 +360,19 @@ def trace_to_chatml(trace: dict) -> dict | None:
     # 2. User message
     messages.append({"role": "user", "content": format_ticket_text(trace["ticket_input"])})
 
-    # 3. Tool calls with <think> blocks
+    # 3. Tool calls with reasoning_content
     tool_calls_data = retrieval.get("tool_calls", [])
     tool_results_data = retrieval.get("tool_results", [])
 
     if tool_calls_data:
-        # First tool call with reasoning
-        think_1 = synthesize_think_block_1(triage)
+        # First tool call: reasoning in reasoning_content, tool call in tool_calls
+        reasoning_1 = synthesize_reasoning_1(triage)
         tc_id = _tool_call_id()
 
         messages.append({
             "role": "assistant",
-            "content": think_1,
+            "content": "",
+            "reasoning_content": reasoning_1,
             "tool_calls": [{
                 "type": "function",
                 "id": tc_id,
@@ -446,11 +404,12 @@ def trace_to_chatml(trace: dict) -> dict | None:
         for i in range(1, len(tool_calls_data)):
             tc = tool_calls_data[i]
             tc_id_n = _tool_call_id()
-            between_think = synthesize_think_between(tc, first_results if i == 1 else [])
+            reasoning_between = synthesize_reasoning_between(tc, first_results if i == 1 else [])
 
             messages.append({
                 "role": "assistant",
-                "content": between_think,
+                "content": "",
+                "reasoning_content": reasoning_between,
                 "tool_calls": [{
                     "type": "function",
                     "id": tc_id_n,
@@ -477,30 +436,30 @@ def trace_to_chatml(trace: dict) -> dict | None:
                 "content": json.dumps({"results": tc_results}, ensure_ascii=False),
             })
 
-        # Final <think> + output JSON
-        think_2 = synthesize_think_block_2(response, tool_results_data, category)
+        # Final response: reasoning in reasoning_content, JSON in content
+        reasoning_final = synthesize_reasoning_final(response, tool_results_data)
         final_output = build_output_json(trace)
+
         messages.append({
             "role": "assistant",
-            "content": f"{think_2}\n{json.dumps(final_output, ensure_ascii=False)}",
+            "reasoning_content": reasoning_final,
+            "content": json.dumps(final_output, ensure_ascii=False),
         })
 
     else:
         # No tool calls — simple acknowledgment
-        think_no_search = (
-            "<think>\n"
-            "This is a simple acknowledgment or follow-up that doesn't require "
-            "searching the knowledge base. The customer is confirming receipt or "
-            "saying thank you — I can respond directly with a brief, warm reply.\n"
-            "</think>"
+        reasoning_no_search = (
+            "Simple acknowledgment or follow-up. Customer is confirming receipt or "
+            "saying thank you. No knowledge base search needed — responding directly."
         )
         final_output = build_output_json(trace)
+
         messages.append({
             "role": "assistant",
-            "content": f"{think_no_search}\n{json.dumps(final_output, ensure_ascii=False)}",
+            "reasoning_content": reasoning_no_search,
+            "content": json.dumps(final_output, ensure_ascii=False),
         })
 
-    # Include tool definitions for Qwen's chat template
     return {
         "tools": [RAG_SEARCH_TOOL],
         "messages": messages,
@@ -508,16 +467,11 @@ def trace_to_chatml(trace: dict) -> dict | None:
 
 
 def create_correction_example(trace: dict) -> dict | None:
-    """Create a training example where the model skips RAG and gets corrected.
-
-    The 'wrong' attempt uses a DEGRADED response (hallucinated/generic), not
-    the correct one, so the model learns that skipping RAG produces bad output.
-    """
+    """Create a training example where the model skips RAG and gets corrected."""
     correct_chatml = trace_to_chatml(trace)
     if not correct_chatml or len(correct_chatml["messages"]) < 4:
         return None
 
-    # Build a degraded output (hallucinated, not grounded)
     output = build_output_json(trace)
     degraded_output = copy.deepcopy(output)
     degraded_output["response"] = random.choice(DEGRADED_RESPONSES)
@@ -526,10 +480,11 @@ def create_correction_example(trace: dict) -> dict | None:
     corrected_messages = [
         correct_chatml["messages"][0],  # system
         correct_chatml["messages"][1],  # user
+        # Model tries to respond without searching (no reasoning_content — it didn't think)
         {"role": "assistant", "content": json.dumps(degraded_output, ensure_ascii=False)},
         {"role": "user", "content": random.choice(CORRECTION_MESSAGES)},
     ]
-    # Then the correct chain (skip system and user, start from first assistant+tool)
+    # Then the correct chain
     corrected_messages.extend(correct_chatml["messages"][2:])
 
     return {
@@ -539,23 +494,19 @@ def create_correction_example(trace: dict) -> dict | None:
 
 
 def create_empty_rag_example(trace: dict, category: str) -> dict | None:
-    """Create an example with empty RAG results teaching graceful degradation.
-
-    The escalation response varies by category to teach context-appropriate fallbacks.
-    """
+    """Create an example with empty RAG results teaching graceful degradation."""
     modified = copy.deepcopy(trace)
     modified["retrieval"]["tool_results"] = []
 
-    # Category-specific escalation responses
     escalation_responses = {
         "quality_complaint": (
             "Hello,\n\nThank you for bringing this to our attention. I'm looking into this "
-            "with our quality team and will get back to you shortly with more information.\n\n"
+            "with our quality team and will get back to you shortly.\n\n"
             "Best regards,\nMarc Logier, Account Manager — Loopper"
         ),
         "delivery_issue": (
             "Hello,\n\nThank you for reaching out. I'm checking on the status of your delivery "
-            "with our logistics team and will update you as soon as I have more details.\n\n"
+            "with our logistics team and will update you as soon as I have details.\n\n"
             "Best regards,\nMarc Logier, Account Manager — Loopper"
         ),
         "refund_request": (
@@ -566,7 +517,7 @@ def create_empty_rag_example(trace: dict, category: str) -> dict | None:
     }
     default_escalation = (
         "Hello,\n\nThank you for reaching out. I'm looking into this with our team "
-        "and will get back to you shortly with more information.\n\n"
+        "and will get back to you shortly.\n\n"
         "Best regards,\nMarc Logier, Account Manager — Loopper"
     )
 
@@ -626,8 +577,7 @@ def main():
         logger.error("No traces found. Run generate_traces.py first.")
         sys.exit(1)
 
-    # CRITICAL: Partition traces into train/eval pools BEFORE generating
-    # any example variants. This prevents data leakage.
+    # Partition traces into train/eval BEFORE generating variants (prevents leakage)
     random.shuffle(traces)
     n_eval_traces = max(1, int(len(traces) * args.eval_split))
     eval_traces = traces[:n_eval_traces]
@@ -635,9 +585,11 @@ def main():
 
     logger.info("Trace pool: %d train, %d eval (no overlap)", len(train_traces), len(eval_traces))
 
-    # Convert train traces to ChatML
+    # Convert to ChatML
     train_examples = []
+    eval_examples = []
     skipped = 0
+
     for trace in train_traces:
         chatml = trace_to_chatml(trace)
         if chatml:
@@ -645,8 +597,6 @@ def main():
         else:
             skipped += 1
 
-    # Convert eval traces
-    eval_examples = []
     for trace in eval_traces:
         chatml = trace_to_chatml(trace)
         if chatml:
@@ -656,7 +606,7 @@ def main():
 
     logger.info("Converted: %d train, %d eval (%d skipped)", len(train_examples), len(eval_examples), skipped)
 
-    # Add correction examples (TRAIN ONLY — from train traces)
+    # Correction examples (TRAIN ONLY)
     n_corrections = int(len(train_traces) * args.correction_ratio)
     correction_pool = random.sample(train_traces, min(n_corrections * 2, len(train_traces)))
     corrections = 0
@@ -669,7 +619,7 @@ def main():
             corrections += 1
     logger.info("Added %d correction examples to train", corrections)
 
-    # Add empty-RAG examples (TRAIN ONLY — from train traces)
+    # Empty-RAG examples (TRAIN ONLY)
     n_empty = int(len(train_traces) * args.empty_rag_ratio)
     empty_pool = random.sample(train_traces, min(n_empty * 2, len(train_traces)))
     empties = 0
@@ -683,7 +633,6 @@ def main():
             empties += 1
     logger.info("Added %d empty-RAG examples to train", empties)
 
-    # Shuffle train
     random.shuffle(train_examples)
 
     # Write JSONL
@@ -699,25 +648,21 @@ def main():
     cat_counts = Counter()
     tool_call_counts = Counter()
     for ex in train_examples + eval_examples:
+        # Extract category from final assistant content
         for msg in reversed(ex["messages"]):
             if msg["role"] == "assistant" and msg.get("content"):
-                content = msg["content"]
-                think_end = content.rfind("</think>")
-                search_from = think_end + len("</think>") if think_end >= 0 else 0
-                json_start = content.find("{", search_from)
-                if json_start >= 0:
-                    try:
-                        output = json.loads(content[json_start:])
-                        cat_counts[output.get("intent", "unknown")] += 1
-                    except json.JSONDecodeError:
-                        pass
+                try:
+                    output = json.loads(msg["content"])
+                    cat_counts[output.get("intent", "unknown")] += 1
+                except json.JSONDecodeError:
+                    pass
                 break
         n_tools = sum(1 for m in ex["messages"] if m["role"] == "tool")
         tool_call_counts[n_tools] += 1
 
     logger.info("")
     logger.info("=" * 60)
-    logger.info("  CHATML DATASET GENERATED")
+    logger.info("  CHATML DATASET GENERATED (Qwen 3.5 reasoning_content format)")
     logger.info("=" * 60)
     logger.info("  Train: %s (%d examples)", train_path, len(train_examples))
     logger.info("  Eval:  %s (%d examples)", eval_path, len(eval_examples))
