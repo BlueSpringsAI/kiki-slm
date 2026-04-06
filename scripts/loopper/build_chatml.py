@@ -33,6 +33,13 @@ import uuid
 from collections import Counter
 from pathlib import Path
 
+try:
+    from langdetect import detect, DetectorFactory, LangDetectException
+    DetectorFactory.seed = 42  # deterministic results
+    LANGDETECT_AVAILABLE = True
+except ImportError:
+    LANGDETECT_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -313,6 +320,113 @@ def build_output_json(trace: dict) -> dict:
     }
 
 
+def build_rejection_output_json(trace: dict) -> dict:
+    """Build the output JSON for a triage-rejected ticket.
+
+    Matches the teacher agent's native output schema exactly:
+    - intent: "other" (matches agent's category for rejected tickets)
+    - is_valid: False (the discriminator for "don't engage")
+    - rejection_type: specific reason (spam, misdirected, newsletter, auto_reply, unrelated)
+
+    No tool calls, no human action, no customer response.
+    """
+    triage = trace.get("triage", {})
+    vr = triage.get("validation_reasoning") or {}
+    rejection_type = vr.get("rejection_type") or "unrelated"
+    reasoning = vr.get("reasoning", "") or "Not a valid Loopper support request"
+
+    # Use category_confidence from the trace (the agent sets this to 0.0 for
+    # rejected tickets — honest signal that the model is not trying to classify
+    # into a business category).
+    confidence = float(triage.get("category_confidence", 0.0) or 0.0)
+
+    return {
+        # intent = "other" matches the teacher agent's native output for rejections.
+        # is_valid=False + rejection_type together form the "don't engage" signal.
+        "intent": "other",
+        "urgency": "low",
+        "confidence": confidence,
+        "is_valid": False,
+        "rejection_type": rejection_type,
+        "resolution_type": "direct_resolve",
+        "team": "none",
+        "actions": [],
+        "summary": [reasoning],
+        "reasoning": {
+            "intent_basis": reasoning,
+            "urgency_basis": "Not a support request — no urgency applies",
+            "resolution_basis": "Can be archived without human action",
+            "policy_used": "Triage policy: reject non-support tickets",
+        },
+        # Empty string (not None) to avoid validator AttributeError on .lower()
+        "response": "",
+    }
+
+
+REJECTION_REASONING_OPENERS = [
+    "Looking at this ticket carefully.",
+    "Let me check what this message is about.",
+    "Reading this ticket.",
+    "Examining this message.",
+    "Let me see what we have here.",
+]
+
+REJECTION_TYPE_DESCRIPTIONS = {
+    "spam": [
+        "This is unsolicited bulk email with no connection to Loopper's business.",
+        "Classic spam — generic marketing pitch, no relation to promotional products.",
+        "This is phishing or bulk marketing, not a real customer inquiry.",
+    ],
+    "misdirected": [
+        "This email was sent to the wrong inbox — it's about something other than Loopper's promotional products business.",
+        "Wrong destination — this concerns a different company's operations, not Loopper.",
+        "This looks like an internal notification from a supplier or partner that was routed here by mistake.",
+    ],
+    "newsletter": [
+        "This is a newsletter or marketing announcement, not a support request.",
+        "Automated marketing content from a third party — not something we respond to.",
+        "This is promotional content from another company, not a customer inquiry.",
+    ],
+    "auto_reply": [
+        "This is an automated out-of-office reply — no actionable content for us.",
+        "Automatic vacation responder from an external address, nothing to act on.",
+        "Auto-generated acknowledgment from an email system, no real request here.",
+    ],
+    "unrelated": [
+        "This is a real email but has nothing to do with promotional products or Loopper's services.",
+        "The sender has a legitimate message but we're not the right party to help — this isn't our business area.",
+        "Real inquiry but outside Loopper's scope — unrelated to our products or services.",
+    ],
+}
+
+
+def synthesize_reasoning_rejection(trace: dict) -> str:
+    """Synthesize reasoning for a triage-rejected ticket.
+
+    Focuses on WHY this isn't a valid Loopper support request — not on HOW
+    to format the output. The schema (is_valid, rejection_type, no tools)
+    is implicit in the training target, not verbalized in the reasoning.
+    Concise: 30-80 tokens.
+    """
+    triage = trace.get("triage", {})
+    vr = triage.get("validation_reasoning") or {}
+    rejection_type = vr.get("rejection_type") or "unrelated"
+    agent_reasoning = (vr.get("reasoning") or "").strip()
+
+    lines = [random.choice(REJECTION_REASONING_OPENERS)]
+
+    # Use the teacher agent's reasoning if it's substantive, otherwise
+    # fall back to a type-specific template.
+    if agent_reasoning and len(agent_reasoning) > 20:
+        lines.append(agent_reasoning)
+    else:
+        type_descriptions = REJECTION_TYPE_DESCRIPTIONS.get(rejection_type, [])
+        if type_descriptions:
+            lines.append(random.choice(type_descriptions))
+
+    return "\n".join(lines)
+
+
 def format_ticket_text(input_state: dict) -> str:
     """Format the ticket input into the user message."""
     ticket = input_state.get("ticket", {})
@@ -466,6 +580,42 @@ def trace_to_chatml(trace: dict) -> dict | None:
     }
 
 
+def rejection_trace_to_chatml(trace: dict) -> dict | None:
+    """Convert a triage-rejected trace into a single-turn rejection example.
+
+    Teaches the model WHEN NOT to engage: for spam, misdirected supplier emails,
+    newsletters, auto-replies, etc., the model should immediately output
+    is_valid=false with the rejection type, no tool calls, no response.
+    """
+    triage = trace.get("triage", {})
+    vr = triage.get("validation_reasoning") or {}
+
+    # Sanity: only valid rejection traces should reach here
+    if triage.get("is_valid") is not False:
+        return None
+    if not vr.get("rejection_type"):
+        return None
+
+    messages = []
+    messages.append({"role": "system", "content": SYSTEM_PROMPT})
+    messages.append({"role": "user", "content": format_ticket_text(trace["ticket_input"])})
+
+    # Single assistant turn: reasoning + rejection JSON, no tool calls
+    reasoning = synthesize_reasoning_rejection(trace)
+    rejection_output = build_rejection_output_json(trace)
+
+    messages.append({
+        "role": "assistant",
+        "reasoning_content": reasoning,
+        "content": json.dumps(rejection_output, ensure_ascii=False),
+    })
+
+    return {
+        "tools": [RAG_SEARCH_TOOL],
+        "messages": messages,
+    }
+
+
 def create_correction_example(trace: dict) -> dict | None:
     """Create a training example where the model skips RAG and gets corrected."""
     correct_chatml = trace_to_chatml(trace)
@@ -531,14 +681,70 @@ def create_empty_rag_example(trace: dict, category: str) -> dict | None:
     return trace_to_chatml(modified)
 
 
-def load_traces(traces_dir: str) -> list[dict]:
-    """Load all trace JSONs, filtering to only 'full' completion status."""
+def is_trace_english(trace: dict) -> bool:
+    """Detect if a trace's customer-facing ticket text is English.
+
+    Secondary filter — sample_tickets.py already runs langdetect on the
+    description at sample time, but ~10% of multi-message tickets slip
+    through (short text, mixed-language signatures). We re-check here on
+    the full concatenated incoming-message body, which is more robust.
+
+    Returns True if English or detection is unreliable (too short).
+    Returns False if detection confirms a non-English language.
+    """
+    if not LANGDETECT_AVAILABLE:
+        return True  # no detector → don't drop anything
+
+    ticket = (trace.get("ticket_input") or {}).get("ticket") or {}
+    messages = ticket.get("messages") or []
+
+    # Concatenate all incoming (customer) messages — gives the detector
+    # more signal than a single short "thanks" reply.
+    incoming_text = " ".join(
+        (m.get("clean_body") or "").strip()
+        for m in messages
+        if m.get("direction") == "incoming"
+    ).strip()
+
+    # Too short to detect reliably — trust the upstream sample filter
+    if len(incoming_text) < 20:
+        return True
+
+    # Use 2000-char window — catches German tickets whose first ~500 chars
+    # are English-dominated ("Hello [NAME],") but whose body is German.
+    # sample_tickets.py uses 500 chars and misses these, which is how the
+    # pilot leaked ~5% non-English through.
+    try:
+        return detect(incoming_text[:2000]) == "en"
+    except LangDetectException:
+        # Detection failed (unusual characters, emojis, etc.) — keep it
+        return True
+
+
+def load_traces(traces_dir: str, english_only: bool = True) -> tuple[list[dict], list[dict]]:
+    """Load all trace JSONs, split into (full, rejection) buckets.
+
+    Args:
+      traces_dir: directory of trace JSONs
+      english_only: if True, drop traces whose customer text is detected
+        as non-English (secondary filter — sample_tickets.py runs a
+        primary filter at sample time but ~10% leak through)
+
+    Returns:
+      (full_traces, rejection_traces)
+      - full_traces: completion_status == "full" (normal RAG + response path)
+      - rejection_traces: completion_status == "triage_rejected" (is_valid=false)
+
+    Other statuses (schema_invalid, partial) are skipped.
+    """
     traces_path = Path(traces_dir)
     files = sorted(traces_path.glob("*.json"))
     files = [f for f in files if not f.name.startswith("_")]
 
-    traces = []
-    skipped = {"triage_rejected": 0, "schema_invalid": 0, "partial": 0}
+    full_traces = []
+    rejection_traces = []
+    skipped = {"schema_invalid": 0, "partial": 0}
+    dropped_non_english = 0
     errors = 0
 
     for f in files:
@@ -546,69 +752,105 @@ def load_traces(traces_dir: str) -> list[dict]:
             with open(f) as fh:
                 trace = json.load(fh)
             status = trace.get("completion_status", "full")
-            if status != "full":
-                skipped[status] = skipped.get(status, 0) + 1
+
+            if english_only and not is_trace_english(trace):
+                dropped_non_english += 1
                 continue
-            traces.append(trace)
+
+            if status == "full":
+                full_traces.append(trace)
+            elif status == "triage_rejected":
+                rejection_traces.append(trace)
+            else:
+                skipped[status] = skipped.get(status, 0) + 1
         except json.JSONDecodeError:
             errors += 1
 
-    logger.info("Loaded %d full traces (%d errors, skipped: %s) from %s",
-                len(traces), errors, dict(skipped), traces_dir)
-    return traces
+    if english_only and not LANGDETECT_AVAILABLE:
+        logger.warning(
+            "langdetect not available — English-only filter DISABLED. "
+            "Install with: uv pip install langdetect"
+        )
+
+    logger.info(
+        "Loaded traces: %d full, %d rejection "
+        "(%d errors, %d non-English dropped, skipped non-usable: %s) from %s",
+        len(full_traces), len(rejection_traces), errors,
+        dropped_non_english, dict(skipped), traces_dir,
+    )
+    return full_traces, rejection_traces
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build ChatML training data from agent traces")
     parser.add_argument("--input-dir", default=TRACES_DIR)
     parser.add_argument("--output-dir", default=OUTPUT_DIR)
-    parser.add_argument("--correction-ratio", type=float, default=0.05)
-    parser.add_argument("--empty-rag-ratio", type=float, default=0.08)
+    parser.add_argument("--correction-ratio", type=float, default=0.05,
+                        help="Fraction of full traces to duplicate as correction examples")
+    parser.add_argument("--empty-rag-ratio", type=float, default=0.08,
+                        help="Fraction of full traces to duplicate as empty-RAG examples")
+    parser.add_argument("--rejection-ratio", type=float, default=0.18,
+                        help="Target fraction of final train set that is rejection examples (capped)")
     parser.add_argument("--eval-split", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--no-english-filter", action="store_true",
+                        help="Disable secondary langdetect filter (keeps all traces)")
     args = parser.parse_args()
 
     random.seed(args.seed)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    traces = load_traces(args.input_dir)
-    if not traces:
+    full_traces, rejection_traces = load_traces(
+        args.input_dir, english_only=not args.no_english_filter
+    )
+    if not full_traces and not rejection_traces:
         logger.error("No traces found. Run generate_traces.py first.")
         sys.exit(1)
 
-    # Partition traces into train/eval BEFORE generating variants (prevents leakage)
-    random.shuffle(traces)
-    n_eval_traces = max(1, int(len(traces) * args.eval_split))
-    eval_traces = traces[:n_eval_traces]
-    train_traces = traces[n_eval_traces:]
+    # Partition full traces into train/eval BEFORE generating variants (prevents leakage)
+    random.shuffle(full_traces)
+    n_eval_full = max(1, int(len(full_traces) * args.eval_split))
+    eval_full_traces = full_traces[:n_eval_full]
+    train_full_traces = full_traces[n_eval_full:]
 
-    logger.info("Trace pool: %d train, %d eval (no overlap)", len(train_traces), len(eval_traces))
+    # Partition rejection traces similarly
+    random.shuffle(rejection_traces)
+    n_eval_rej = max(1, int(len(rejection_traces) * args.eval_split)) if rejection_traces else 0
+    eval_rejection_traces = rejection_traces[:n_eval_rej]
+    train_rejection_traces = rejection_traces[n_eval_rej:]
 
-    # Convert to ChatML
+    logger.info(
+        "Trace pool: train=%d full + %d rejection | eval=%d full + %d rejection",
+        len(train_full_traces), len(train_rejection_traces),
+        len(eval_full_traces), len(eval_rejection_traces),
+    )
+
+    # --- Convert full traces to ChatML ---
     train_examples = []
     eval_examples = []
     skipped = 0
 
-    for trace in train_traces:
+    for trace in train_full_traces:
         chatml = trace_to_chatml(trace)
         if chatml:
             train_examples.append(chatml)
         else:
             skipped += 1
 
-    for trace in eval_traces:
+    for trace in eval_full_traces:
         chatml = trace_to_chatml(trace)
         if chatml:
             eval_examples.append(chatml)
         else:
             skipped += 1
 
-    logger.info("Converted: %d train, %d eval (%d skipped)", len(train_examples), len(eval_examples), skipped)
+    logger.info("Converted full traces: %d train, %d eval (%d skipped)",
+                len(train_examples), len(eval_examples), skipped)
 
-    # Correction examples (TRAIN ONLY)
-    n_corrections = int(len(train_traces) * args.correction_ratio)
-    correction_pool = random.sample(train_traces, min(n_corrections * 2, len(train_traces)))
+    # --- Correction examples (TRAIN ONLY, derived from full traces) ---
+    n_corrections = int(len(train_full_traces) * args.correction_ratio)
+    correction_pool = random.sample(train_full_traces, min(n_corrections * 2, len(train_full_traces)))
     corrections = 0
     for trace in correction_pool:
         if corrections >= n_corrections:
@@ -619,9 +861,9 @@ def main():
             corrections += 1
     logger.info("Added %d correction examples to train", corrections)
 
-    # Empty-RAG examples (TRAIN ONLY)
-    n_empty = int(len(train_traces) * args.empty_rag_ratio)
-    empty_pool = random.sample(train_traces, min(n_empty * 2, len(train_traces)))
+    # --- Empty-RAG examples (TRAIN ONLY, derived from full traces) ---
+    n_empty = int(len(train_full_traces) * args.empty_rag_ratio)
+    empty_pool = random.sample(train_full_traces, min(n_empty * 2, len(train_full_traces)))
     empties = 0
     for trace in empty_pool:
         if empties >= n_empty:
@@ -632,6 +874,73 @@ def main():
             train_examples.append(ex)
             empties += 1
     logger.info("Added %d empty-RAG examples to train", empties)
+
+    # --- Rejection examples (capped to rejection-ratio of final train set) ---
+    # Per expert recommendation: cap rejections to ~15-20% of the total train
+    # set to prevent imbalance toward over-rejecting. Stratify across rejection
+    # types so the model sees the full distribution.
+    current_train_size = len(train_examples)
+    # target_rejection_count is the number of rejections that would make
+    # rejection_ratio of the FINAL train size (current + rejections)
+    if args.rejection_ratio > 0 and args.rejection_ratio < 1:
+        target_rejection_count = int(current_train_size * args.rejection_ratio / (1 - args.rejection_ratio))
+    else:
+        target_rejection_count = 0
+
+    n_rejections_train = min(target_rejection_count, len(train_rejection_traces))
+
+    # Stratified sample across rejection types
+    rejection_by_type: dict[str, list] = {}
+    for trace in train_rejection_traces:
+        rt = (trace.get("triage", {}).get("validation_reasoning") or {}).get("rejection_type") or "unrelated"
+        rejection_by_type.setdefault(rt, []).append(trace)
+
+    rejection_train_sample = []
+    if rejection_by_type and n_rejections_train > 0:
+        # Distribute evenly across rejection types, then top up from largest bucket
+        per_type = max(1, n_rejections_train // len(rejection_by_type))
+        for rt, traces_list in rejection_by_type.items():
+            random.shuffle(traces_list)
+            rejection_train_sample.extend(traces_list[:per_type])
+        # Trim or top up to exact target
+        if len(rejection_train_sample) > n_rejections_train:
+            rejection_train_sample = random.sample(rejection_train_sample, n_rejections_train)
+        elif len(rejection_train_sample) < n_rejections_train:
+            remaining = [t for traces_list in rejection_by_type.values() for t in traces_list
+                         if t not in rejection_train_sample]
+            random.shuffle(remaining)
+            rejection_train_sample.extend(remaining[: n_rejections_train - len(rejection_train_sample)])
+
+    rejections_added_train = 0
+    rejection_type_counts: dict[str, int] = {}
+    for trace in rejection_train_sample:
+        ex = rejection_trace_to_chatml(trace)
+        if ex:
+            train_examples.append(ex)
+            rejections_added_train += 1
+            rt = (trace.get("triage", {}).get("validation_reasoning") or {}).get("rejection_type", "unknown")
+            rejection_type_counts[rt] = rejection_type_counts.get(rt, 0) + 1
+
+    logger.info(
+        "Added %d rejection examples to train (%.1f%% of train set)",
+        rejections_added_train,
+        rejections_added_train / len(train_examples) * 100 if train_examples else 0,
+    )
+    for rt, count in sorted(rejection_type_counts.items(), key=lambda x: -x[1]):
+        logger.info("    %-25s %5d", rt, count)
+
+    # --- Rejection examples for eval (the 10% split from rejection pool) ---
+    # Eval gets its own 10% slice of rejection traces (set aside before train
+    # conversion to prevent leakage). This gives us ~10% rejection representation
+    # in eval, matching the pool split rather than the train cap.
+    rejections_added_eval = 0
+    for trace in eval_rejection_traces:
+        ex = rejection_trace_to_chatml(trace)
+        if ex:
+            eval_examples.append(ex)
+            rejections_added_eval += 1
+    logger.info("Added %d rejection examples to eval (from %d eval-pool traces)",
+                rejections_added_eval, len(eval_rejection_traces))
 
     random.shuffle(train_examples)
 

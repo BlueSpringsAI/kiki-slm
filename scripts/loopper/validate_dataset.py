@@ -7,14 +7,14 @@ they corrupt training. Produces a validation report with pass/fail counts.
 Checks:
   1. JSON validity of all assistant outputs
   2. Schema compliance (all 11 required fields)
-  3. <think> block presence, count, and quality
+  3. reasoning_content presence, count, and quality (Qwen3-Thinking format)
   4. Tool call validity (collection names, query content, id linkage)
   5. Role ordering (correct assistant→tool pairing)
   6. Category distribution balance
   7. Response quality (signature, banned phrases, length)
   8. Token length estimation (warns on examples that may exceed max_seq_length)
   9. Cross-file train/eval leakage detection
-  10. is_valid / rejection_type consistency
+  10. is_valid / rejection_type consistency (intent="other" for rejections)
 
 Usage:
     python scripts/loopper/validate_dataset.py
@@ -42,20 +42,24 @@ _PATHS = _get_paths()
 CHATML_DIR = _PATHS["chatml_output"]
 
 # ── Valid values ──────────────────────────────────────────────
+# NOTE: "intent" values are the business categories only. Rejection examples
+# use intent="other" with rejection_type as the discriminator (matches the
+# teacher agent's native schema). The agent's ValidationReasoning Pydantic
+# Literal has exactly 5 rejection types: spam, misdirected, newsletter,
+# auto_reply, unrelated. system_notification is NOT in the agent's schema.
 VALID_INTENTS = {
     "new_order_inquiry", "design_update", "payment_confirmation",
     "delivery_issue", "refund_request", "order_cancellation",
     "quality_complaint", "sample_request", "price_negotiation",
     "customer_feedback", "other",
-    "spam", "misdirected", "newsletter", "auto_reply", "unrelated",
-    "system_notification",
 }
 
 VALID_URGENCIES = {"low", "medium", "high", "critical"}
 VALID_RESOLUTION_TYPES = {"direct_resolve", "requires_human_action", "needs_escalation", "needs_more_info"}
 VALID_TEAMS = {"design", "logistics", "finance", "account_manager", "none"}
 VALID_COLLECTIONS = {"faq", "operations", "communication_guidelines", "supplier_data"}
-REJECTION_INTENTS = {"spam", "misdirected", "newsletter", "auto_reply", "unrelated", "system_notification"}
+# Rejection types come from the agent's ValidationReasoning Literal (5 values).
+VALID_REJECTION_TYPES = {"spam", "misdirected", "newsletter", "auto_reply", "unrelated"}
 
 REQUIRED_OUTPUT_FIELDS = {
     "intent", "urgency", "confidence", "is_valid", "rejection_type",
@@ -202,37 +206,60 @@ def validate_example(example: dict, idx: int, max_seq_length: int) -> list[dict]
             if not tc_id:
                 issue("warning", "tool_response_id", "Tool response missing 'tool_call_id'")
 
-    # ── 4. <think> block presence and quality ──
-    think_blocks = []
+    # ── 4. Reasoning content presence and quality ──
+    # For Qwen3-Thinking models, reasoning lives in the `reasoning_content`
+    # field on assistant messages (NOT in <think> tags inside content).
+    # The Unsloth-patched chat template renders reasoning_content → <think>
+    # blocks in the final tokenized string, but in our training data they
+    # are a separate field.
+    #
+    # We also support the legacy <think>...</think> format inside content
+    # for backward compatibility, but new data should use reasoning_content.
+    reasoning_blocks = []
     for msg in messages:
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "") or ""
-            for match in re.finditer(r"<think>(.*?)</think>", content, re.DOTALL):
-                think_blocks.append(match.group(1).strip())
+        if msg.get("role") != "assistant":
+            continue
+        # Primary: reasoning_content field (Qwen3-Thinking format)
+        rc = msg.get("reasoning_content")
+        if rc:
+            reasoning_blocks.append(str(rc).strip())
+            continue
+        # Legacy fallback: <think>...</think> tags inside content
+        content = msg.get("content", "") or ""
+        for match in re.finditer(r"<think>(.*?)</think>", content, re.DOTALL):
+            reasoning_blocks.append(match.group(1).strip())
 
-    if not think_blocks:
-        issue("error", "think_missing", "No <think> block found in any assistant message")
+    if not reasoning_blocks:
+        issue("error", "reasoning_missing",
+              "No reasoning_content field or <think> block found in any assistant message")
     else:
-        # Quality checks on first think block
-        if len(think_blocks[0]) < 30:
-            issue("warning", "think_quality", f"First <think> block too short ({len(think_blocks[0])} chars)")
+        # Quality checks on first reasoning block
+        if len(reasoning_blocks[0]) < 30:
+            issue("warning", "reasoning_quality",
+                  f"First reasoning block too short ({len(reasoning_blocks[0])} chars)")
 
-        # First think should contain search plan or reasoning
-        first_think_lower = think_blocks[0].lower()
-        has_reasoning = any(kw in first_think_lower for kw in [
+        # First reasoning block should contain intent analysis or search plan
+        first_reasoning_lower = reasoning_blocks[0].lower()
+        has_reasoning = any(kw in first_reasoning_lower for kw in [
             "intent", "customer", "search", "need to", "looking at",
+            "analyzing", "ticket", "request", "loopper", "primary",
         ])
         if not has_reasoning:
-            issue("warning", "think_quality", "First <think> block lacks reasoning keywords")
+            issue("warning", "reasoning_quality",
+                  "First reasoning block lacks reasoning keywords")
 
-        # Check for answer leakage in think blocks
-        for tb in think_blocks:
-            if '"intent":' in tb or '"response":' in tb:
-                issue("warning", "think_leakage", "<think> block contains JSON output fields")
+        # Check for output schema leakage in reasoning
+        # (reasoning should explain WHY, not mirror the JSON output fields)
+        for rb in reasoning_blocks:
+            if '"intent":' in rb or '"response":' in rb or '"rejection_type":' in rb:
+                issue("warning", "reasoning_leakage",
+                      "Reasoning block contains JSON output field keys")
 
-        # For examples with tool calls, should have at least 2 think blocks
-        if has_tool_call and len(think_blocks) < 2:
-            issue("warning", "think_count", f"Only {len(think_blocks)} think block(s) with tool calls (expected >= 2)")
+        # For examples with tool calls, should have at least 2 reasoning blocks
+        # (one before first tool call, one before final output)
+        if has_tool_call and len(reasoning_blocks) < 2:
+            issue("warning", "reasoning_count",
+                  f"Only {len(reasoning_blocks)} reasoning block(s) with tool calls (expected >= 2)")
 
     # ── 5. Final output JSON ──
     final_output = None
@@ -297,8 +324,11 @@ def validate_example(example: dict, idx: int, max_seq_length: int) -> list[dict]
         issue("warning", "output_reasoning", f"'reasoning' should be a dict, got {type(reasoning)}")
 
     # ── 6. Response quality ──
-    response_text = final_output.get("response", "")
-    is_rejection = intent in REJECTION_INTENTS
+    # Coerce None → "" defensively. Rejection examples set response="" intentionally.
+    response_text = final_output.get("response") or ""
+    # Rejection examples are keyed by is_valid=False (matches teacher schema).
+    # Rejection type is checked separately via rejection_type field.
+    is_rejection = final_output.get("is_valid") is False
 
     if not is_rejection:
         if not response_text or len(response_text.strip()) < 20:
@@ -310,6 +340,14 @@ def validate_example(example: dict, idx: int, max_seq_length: int) -> list[dict]
     for phrase in BANNED_RESPONSE_PHRASES:
         if phrase.lower() in response_text.lower():
             issue("warning", "response_banned", f"Contains banned phrase: '{phrase}'")
+
+    # Validate rejection_type matches the allowed set when is_valid=False
+    if is_rejection:
+        rt = final_output.get("rejection_type")
+        if not rt:
+            issue("error", "rejection_type_missing", "is_valid=False but rejection_type is empty")
+        elif rt not in VALID_REJECTION_TYPES:
+            issue("error", "rejection_type_invalid", f"Invalid rejection_type: '{rt}'")
 
     # ── 7. RAG enforcement ──
     is_acknowledgment = intent == "customer_feedback" and urgency == "low"
@@ -377,16 +415,20 @@ def validate_dataset(input_path: str, max_seq_length: int) -> dict:
 
     # Category distribution checks
     distribution_issues = []
+    # Rejection examples have intent="other", so "other" should always exist.
+    # The 11 business intents should all be present; flag any missing.
     missing_cats = VALID_INTENTS - set(category_counts.keys())
     if missing_cats:
         distribution_issues.append(f"Missing categories: {missing_cats}")
     for cat, count in category_counts.items():
-        if cat in VALID_INTENTS and count < 5 and cat not in REJECTION_INTENTS:
+        # "other" can legitimately be lower (it's the rejection bucket and catch-all)
+        if cat in VALID_INTENTS and count < 5 and cat != "other":
             distribution_issues.append(f"Category '{cat}' has only {count} examples (< 5)")
     total_examples = len(examples)
     if total_examples > 0:
         for cat, count in category_counts.items():
-            if count / total_examples > 0.40:
+            # Allow "other" to exceed 40% since it holds all rejection examples
+            if count / total_examples > 0.40 and cat != "other":
                 distribution_issues.append(f"Category '{cat}' represents {count/total_examples:.0%} of dataset (> 40%)")
 
     # Duplicate ticket detection

@@ -23,6 +23,13 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
+try:
+    from langdetect import detect, DetectorFactory, LangDetectException
+    DetectorFactory.seed = 42  # deterministic results
+    LANGDETECT_AVAILABLE = True
+except ImportError:
+    LANGDETECT_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -89,11 +96,33 @@ def classify_sentiment(score: int | None) -> str:
     return "positive"
 
 
-def is_english(lang: str | None) -> bool:
-    """Check if a ticket's detected language qualifies as English."""
-    if not lang:
-        return True
-    return lang.lower().split("-")[0] in {"en", "none", ""}
+def is_english(description: str, metadata_lang: str | None = None) -> bool:
+    """Detect if a ticket is English by running langdetect on its description text.
+
+    Trusts metadata_lang ONLY when description is too short to detect reliably.
+    Freshdesk's detected_language field is unreliable — some German tickets are
+    marked as 'en', so we verify using actual content.
+    """
+    text = (description or "").strip()
+
+    # Too short to detect reliably — trust metadata
+    if len(text) < 20:
+        if not metadata_lang:
+            return True
+        return metadata_lang.lower().split("-")[0] in {"en", "none", ""}
+
+    if not LANGDETECT_AVAILABLE:
+        # Fallback to metadata-only filter
+        if not metadata_lang:
+            return True
+        return metadata_lang.lower().split("-")[0] in {"en", "none", ""}
+
+    # Use first 500 chars — enough for reliable detection, fast
+    try:
+        return detect(text[:500]) == "en"
+    except LangDetectException:
+        # Detection failed (unusual characters, etc.) — err on the side of excluding
+        return False
 
 
 def classify_category_proxy(tags: list) -> str:
@@ -147,13 +176,14 @@ def load_ticket_features(filtered_dir: str) -> list[dict]:
 
             ticket = data.get("ticket", {})
             lang = ticket.get("detected_language")
+            desc = (ticket.get("description_text", "") or "").strip()
 
-            # English-only filter
-            if not is_english(lang):
+            # English-only filter — uses langdetect on description text,
+            # falls back to metadata only when text is too short
+            if not is_english(desc, lang):
                 skipped_language += 1
                 continue
 
-            desc = (ticket.get("description_text", "") or "").strip()
             tags = ticket.get("tags", []) or []
 
             tickets.append({
@@ -389,12 +419,13 @@ def main():
             "sentiment": dict(Counter(t["sentiment"] for t in sampled)),
             "category_proxy": dict(Counter(t["category_proxy"] for t in sampled)),
         },
-        "joint_distribution": dict(
-            Counter(
+        "joint_distribution": {
+            f"{d}|{s}|{c}": count
+            for (d, s, c), count in Counter(
                 (t["depth"], t["sentiment"], t["category_proxy"])
                 for t in sampled
             ).most_common(50)
-        ),
+        },
         "ticket_ids": [t["ticket_id"] for t in sampled],
     }
     manifest_path = output_dir / "_sampling_manifest.json"

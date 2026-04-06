@@ -35,6 +35,8 @@ dependencies = [
     "pandas>=2.0",
     "numpy",
     "tenacity>=8.2",
+    # Language detection (used in scripts/loopper/sample_tickets.py)
+    "langdetect>=1.0.9",
 ]
 
 [project.optional-dependencies]

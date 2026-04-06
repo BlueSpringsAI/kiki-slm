@@ -7,11 +7,12 @@
 
 # --- Paths ---
 paths:
-  filtered_tickets: /Users/sriranga/Desktop/kiki-train/data/filtered_tickets
-  sampled_tickets: /Users/sriranga/Desktop/kiki-train/data/sampled_tickets
-  traces: /Users/sriranga/Desktop/kiki-train/data/traces
-  chatml_output: /Users/sriranga/Desktop/kiki-train/data/chatml
-  agent_src: null  # Path to Looper-Support-Agent-Server/src (null = skip agent import)
+  # filtered/ is 3.2GB — reuse from original workspace instead of duplicating
+  filtered_tickets: /Users/vishnu/Dev/bluesprings/Loopper/Loopper-AI/finetune-dataset/data/filtered
+  sampled_tickets: /Users/vishnu/Dev/bluesprings/slm/finetune-trials/curation/finetune-dataset/data/sampled
+  traces: /Users/vishnu/Dev/bluesprings/slm/finetune-trials/curation/finetune-dataset/data/traces
+  chatml_output: /Users/vishnu/Dev/bluesprings/slm/finetune-trials/curation/finetune-dataset/data/chatml
+  agent_src: /Users/vishnu/Dev/bluesprings/slm/finetune-trials/curation/Looper-Support-Agent-Server/src
 
 # --- Step 2: Sampling ---
 sampling:
@@ -164,28 +165,31 @@ chatml:
     default: "I'll need to check with the relevant team and get back to you."
 
 # --- Step 5: Validation ---
+#
+# NOTE: This section documents the SLM's output schema — it reflects what
+# `build_chatml.py:build_output_json()` actually emits and what
+# `validate_dataset.py` enforces. It is currently documentation-only
+# (no scripts read from it at runtime; the validator hard-codes the same
+# values in Python). Keep in sync if the code changes.
 validation:
   max_seq_length: 4096
   strict: false
 
+  # 11 Loopper business intents — the agent's TicketCategory enum.
+  # Rejection examples use intent="other" with rejection_type as the
+  # discriminator (matches the teacher agent's native output for rejections).
   valid_intents:
     - new_order_inquiry
-    - quality_complaint
-    - delivery_issue
     - design_update
-    - pricing_request
-    - reorder
-    - account_inquiry
+    - payment_confirmation
+    - delivery_issue
+    - refund_request
+    - order_cancellation
+    - quality_complaint
     - sample_request
-    - general_support
+    - price_negotiation
+    - customer_feedback
     - other
-    - spam
-    - misdirected
-    - newsletter
-    - auto_reply
-    - unrelated
-    - system_notification
-    - acknowledgment
 
   valid_urgencies: [low, medium, high, critical]
 
@@ -202,26 +206,31 @@ validation:
     - account_manager
     - none
 
-  rejection_intents:
+  # Rejection types — from the agent's ValidationReasoning Literal (5 values).
+  # Populated on the `rejection_type` field when is_valid=False.
+  # IMPORTANT: do NOT add system_notification — the agent cannot emit it.
+  rejection_types:
     - spam
     - misdirected
     - newsletter
     - auto_reply
     - unrelated
-    - system_notification
 
+  # SLM output JSON schema (11 fields, what the fine-tuned model must emit).
+  # This is the renamed schema produced by build_chatml.build_output_json()
+  # from the teacher agent's raw LangGraph output.
   required_output_fields:
-    - summary
-    - resolution_type
-    - human_team_required
-    - action_list
-    - is_valid
-    - response_english
-    - category
-    - category_confidence
-    - urgency
-    - action_reasoning
-    - resolution_reasoning
+    - intent              # one of valid_intents
+    - urgency             # one of valid_urgencies
+    - confidence          # float 0.0-1.0
+    - is_valid            # bool — false for rejections
+    - rejection_type      # one of rejection_types (or null for is_valid=true)
+    - resolution_type     # one of valid_resolution_types
+    - team                # one of valid_teams
+    - actions             # list[str] — recommended next actions
+    - summary             # list[str] — bullet-point summary
+    - reasoning           # dict{intent_basis,urgency_basis,resolution_basis,policy_used}
+    - response            # str — customer-facing reply (empty for rejections)
 
   banned_response_phrases:
     - "en tant qu"
@@ -235,10 +244,10 @@ validation:
     - "i'm unable to"
 
   thresholds:
-    min_think_block_chars: 30
+    min_reasoning_chars: 30   # reasoning_content field minimum length
     min_query_chars: 3
     min_response_chars: 20
     min_category_examples: 5
     max_category_pct: 0.40
-    token_chars_ratio: 3.5  # 1 token per 3.5 chars (estimate)
-    duplicate_threshold: 2  # flag if ticket appears > N times
+    token_chars_ratio: 3.5    # 1 token per 3.5 chars (estimate)
+    duplicate_threshold: 2    # flag if ticket appears > N times

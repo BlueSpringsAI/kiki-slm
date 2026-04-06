@@ -77,7 +77,13 @@ def merge_config(cfg: dict, args: argparse.Namespace) -> dict:
         "train_file": args.train_file or cfg.get("data", {}).get("train_file", ""),
         "eval_file": args.eval_file or cfg.get("data", {}).get("eval_file", ""),
         "output_dir": args.output_dir or cfg.get("output", {}).get("adapter_dir", ""),
-        "base_model": args.base_model or cfg.get("model", {}).get("name", "Qwen/Qwen3-4B-Instruct-2507"),
+        # IMPORTANT: Use unsloth/ repo (not Qwen/) for Qwen3-4B-Thinking-2507.
+        # Unsloth ships the patched chat template that correctly renders
+        # reasoning_content as <think> blocks and handles tool calls with
+        # reasoning together. The official Qwen repo template had bugs that
+        # broke fine-tuning with assistant_only_loss (loss masking).
+        # See: https://huggingface.co/unsloth/Qwen3-4B-Thinking-2507-GGUF/discussions/1
+        "base_model": args.base_model or cfg.get("model", {}).get("name", "unsloth/Qwen3-4B-Thinking-2507"),
         "max_seq_length": args.max_seq_length or cfg.get("model", {}).get("max_seq_length", 2048),
         "load_in_4bit": cfg.get("model", {}).get("load_in_4bit", True),
         "lora_r": args.lora_r or cfg.get("lora", {}).get("r", 32),
@@ -137,17 +143,82 @@ def auto_detect_gpu(profiles: dict) -> dict:
 # Chat template helper
 # ---------------------------------------------------------------------------
 
+# Fields that Qwen3 chat template needs on assistant/tool messages.
+# Must be preserved when normalizing — stripping these silently breaks
+# tool calling and reasoning content rendering.
+_MESSAGE_FIELDS = ("role", "content", "reasoning_content", "tool_calls", "tool_call_id", "name")
+
+
+def _normalize_message(msg: dict) -> dict:
+    """Normalize a message for the Qwen chat template without dropping fields.
+
+    Preserves: role, content, reasoning_content, tool_calls, tool_call_id, name.
+    Leaves content=None for tool-call-only assistant turns (Qwen template handles
+    None correctly; empty string causes the model to learn to emit "").
+    """
+    out = {"role": str(msg.get("role", "user"))}
+    # Content: preserve None/empty string as-is for tool-call turns.
+    # If the assistant message has tool_calls, content SHOULD be None.
+    # If it has a string, pass it through.
+    if "content" in msg:
+        content = msg["content"]
+        if content is None:
+            # Qwen template expects None (not "") for tool-call-only turns
+            out["content"] = None
+        else:
+            out["content"] = str(content)
+    else:
+        out["content"] = None
+    # Preserve reasoning_content (thinking models)
+    if msg.get("reasoning_content") is not None:
+        out["reasoning_content"] = str(msg["reasoning_content"])
+    # Preserve tool_calls (list of dicts with id/type/function)
+    if msg.get("tool_calls"):
+        out["tool_calls"] = msg["tool_calls"]
+    # Preserve tool_call_id (on tool-result messages)
+    if msg.get("tool_call_id"):
+        out["tool_call_id"] = str(msg["tool_call_id"])
+    # Preserve tool name (on tool-result messages)
+    if msg.get("name"):
+        out["name"] = str(msg["name"])
+    return out
+
+
 def apply_chat_template_to_dataset(dataset, tokenizer):
+    """Render ChatML examples through the Qwen3 chat template.
+
+    Preserves tool_calls, reasoning_content, and tool_call_id so that
+    tool-calling and thinking-mode examples render correctly. Passes the
+    per-example `tools` list to apply_chat_template so tool schemas appear
+    in the rendered text.
+    """
     original_template = tokenizer.chat_template
+    has_tools_column = "tools" in dataset.column_names
 
     def _apply(examples):
         texts = []
-        for msgs in examples["messages"]:
-            clean = [{"role": str(m.get("role", "user")), "content": str(m.get("content") or "")} for m in msgs]
+        msgs_batch = examples["messages"]
+        tools_batch = examples.get("tools") if has_tools_column else None
+
+        for i, msgs in enumerate(msgs_batch):
+            normalized = [_normalize_message(m) for m in msgs]
+            tools_arg = tools_batch[i] if tools_batch is not None else None
+
             try:
-                text = tokenizer.apply_chat_template(clean, tokenize=False, add_generation_prompt=False)
-            except Exception:
-                parts = [f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>" for m in clean]
+                # Pass tools= so the Qwen template injects the tool schema
+                # into the system block. Without this, the model never sees
+                # what tools are available during training.
+                text = tokenizer.apply_chat_template(
+                    normalized,
+                    tools=tools_arg,
+                    tokenize=False,
+                    add_generation_prompt=False,
+                )
+            except Exception as e:
+                # Fallback: manual rendering (loses tool-call formatting,
+                # but at least preserves content). Should rarely trigger.
+                print(f"    WARN: chat template failed ({type(e).__name__}: {e}), using fallback")
+                parts = [f"<|im_start|>{m['role']}\n{m.get('content') or ''}<|im_end|>" for m in normalized]
                 text = "\n".join(parts)
             texts.append(text)
         return {"text": texts}
@@ -320,6 +391,23 @@ def main():
         train_dataset=train_dataset, eval_dataset=eval_dataset,
         args=training_args, callbacks=[StepCountCallback()],
     )
+
+    # Loss masking: only compute loss on assistant turns, not on user tickets
+    # or tool results. Without this, the model wastes capacity learning to
+    # predict retrieved KB documents and customer ticket text.
+    try:
+        from unsloth.chat_templates import train_on_responses_only
+        # Qwen3 ChatML format uses <|im_start|>{role}\n ... <|im_end|>
+        trainer = train_on_responses_only(
+            trainer,
+            instruction_part="<|im_start|>user\n",
+            response_part="<|im_start|>assistant\n",
+        )
+        print("  Loss masking: enabled (train_on_responses_only)")
+    except ImportError:
+        print("  WARNING: unsloth.chat_templates.train_on_responses_only not available — loss computed on all tokens")
+    except Exception as e:
+        print(f"  WARNING: train_on_responses_only failed ({type(e).__name__}: {e}) — loss computed on all tokens")
 
     # Resume
     resume_checkpoint = None

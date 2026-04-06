@@ -7,8 +7,13 @@
 
 # --- Model ---
 model:
-  name: Qwen/Qwen3-4B-Instruct-2507
-  max_seq_length: 2048
+  # Using Unsloth's repo for the patched chat template that correctly renders
+  # reasoning_content as <think> blocks and handles tool calls with reasoning
+  # together. The official Qwen/Qwen3-4B-Instruct-2507 repo has known template
+  # bugs around generation masking that break fine-tuning with
+  # train_on_responses_only (assistant_only_loss).
+  name: unsloth/Qwen3-4B-Thinking-2507
+  max_seq_length: 4096
   load_in_4bit: true
 
 # --- LoRA ---

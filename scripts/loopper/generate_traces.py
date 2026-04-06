@@ -44,8 +44,31 @@ AGENT_SRC = _PATHS["agent_src"] or ""
 
 def setup_agent_path():
     """Add agent source to Python path and configure environment for batch mode."""
-    src_path = os.path.join(AGENT_SRC, "src")
-    if src_path not in sys.path:
+    # Load the agent's .env file (OPENAI_API_KEY, RAG_MCP_URL, etc.).
+    # The agent itself doesn't call load_dotenv — LangGraph dev does it
+    # when running as a server. We must do it ourselves for direct ainvoke().
+    if AGENT_SRC:
+        agent_root = os.path.dirname(AGENT_SRC)  # AGENT_SRC = .../src, root = ...
+        env_file = os.path.join(agent_root, ".env")
+        if os.path.exists(env_file):
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(env_file, override=False)
+            except ImportError:
+                # Fall back to manual parsing if python-dotenv isn't available
+                with open(env_file) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+
+    src_path = AGENT_SRC
+    if src_path and src_path not in sys.path:
         sys.path.insert(0, src_path)
 
     # CRITICAL: Disable human review interrupt — otherwise ainvoke will hang
