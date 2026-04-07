@@ -62,8 +62,9 @@ training:
 
 # --- Data ---
 data:
-  train_file: /content/drive/MyDrive/kiki-slm/data/kiki_sft_chatml_train.jsonl
-  eval_file: /content/drive/MyDrive/kiki-slm/data/kiki_sft_chatml_eval.jsonl
+  # Loopper organic dataset (trimmed: 4,099 train + 445 eval, tool calls + reasoning)
+  train_file: /content/drive/MyDrive/kiki-slm/data/sft-data/train_trimmed.jsonl
+  eval_file: /content/drive/MyDrive/kiki-slm/data/sft-data/eval_trimmed.jsonl
   gold_file: /content/drive/MyDrive/kiki-slm/data/gold_100.jsonl
 
 # --- Output ---
