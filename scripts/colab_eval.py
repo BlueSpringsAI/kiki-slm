@@ -54,6 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--adapter-path", default=None)
     parser.add_argument("--base-model", default=None)
     parser.add_argument("--gold-file", default=None)
+    parser.add_argument("--train-file", default=None, help="Training JSONL to extract system prompt + tools from")
     parser.add_argument("--output-file", default=None)
     parser.add_argument("--max-seq-length", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -78,22 +79,12 @@ def parse_args() -> argparse.Namespace:
 
 
 # ---------------------------------------------------------------------------
-# Constants
+# Constants — loaded from training data if available
 # ---------------------------------------------------------------------------
 
-EVAL_SYSTEM_PROMPT = (
-    "You are Kiki, an AI customer service agent. Analyze the customer message "
-    "and respond with valid JSON containing: intent, urgency, workflow_steps, "
-    "tools_required, reasoning, response."
-)
-
-GOLD_TEMPLATE = [
-    {"ticket_id": "GOLD-001", "customer_message": "I placed order #12345 three days ago and it still shows processing.", "gold_intent": "order_status", "gold_urgency": "medium"},
-    {"ticket_id": "GOLD-002", "customer_message": "I was charged twice for my subscription this month. I need a refund.", "gold_intent": "billing_inquiry", "gold_urgency": "high"},
-    {"ticket_id": "GOLD-003", "customer_message": "My account has been locked and I cannot log in.", "gold_intent": "account_management", "gold_urgency": "critical"},
-    {"ticket_id": "GOLD-004", "customer_message": "I want to return the headphones I bought last week.", "gold_intent": "return_request", "gold_urgency": "low"},
-    {"ticket_id": "GOLD-005", "customer_message": "Someone made unauthorized purchases on my account totaling $500!", "gold_intent": "fraud_report", "gold_urgency": "critical"},
-]
+# Will be populated from training data in main()
+EVAL_SYSTEM_PROMPT = ""
+EVAL_TOOLS = None  # Tool definitions from training data
 
 
 # ---------------------------------------------------------------------------
@@ -157,46 +148,59 @@ def auto_detect_batch_size() -> int:
 def run_batched_inference(
     model, tokenizer, messages: list[str], batch_size: int,
 ) -> list[tuple[dict | None, str, float]]:
-    """Run inference in batches for faster evaluation on high-VRAM GPUs."""
+    """Run inference in batches for faster evaluation on high-VRAM GPUs.
+
+    Uses EVAL_SYSTEM_PROMPT and EVAL_TOOLS (loaded from training data in main()).
+    """
+    global EVAL_SYSTEM_PROMPT, EVAL_TOOLS
     results = []
+    max_new_tokens = 1024  # Loopper 11-field output is longer than generic
 
     for batch_start in range(0, len(messages), batch_size):
         batch_msgs = messages[batch_start:batch_start + batch_size]
 
-        # Build prompts
+        # Build prompts — pass tools so model sees the tool schema
         prompts = []
         for msg in batch_msgs:
-            prompt = tokenizer.apply_chat_template(
-                [{"role": "system", "content": EVAL_SYSTEM_PROMPT},
-                 {"role": "user", "content": msg}],
-                tokenize=False, add_generation_prompt=True,
-            )
+            chat_msgs = [
+                {"role": "system", "content": EVAL_SYSTEM_PROMPT},
+                {"role": "user", "content": msg},
+            ]
+            try:
+                prompt = tokenizer.apply_chat_template(
+                    chat_msgs,
+                    tools=EVAL_TOOLS,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                # Fallback without tools
+                prompt = tokenizer.apply_chat_template(
+                    chat_msgs, tokenize=False, add_generation_prompt=True,
+                )
             prompts.append(prompt)
 
         if batch_size == 1 or len(prompts) == 1:
-            # Sequential (T4 or single item) — no padding needed
             for prompt in prompts:
                 inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
                 input_len = inputs["input_ids"].shape[1]
 
                 start = time.perf_counter()
                 with torch.no_grad():
-                    outputs = model.generate(**inputs, max_new_tokens=512, temperature=0.1, do_sample=True)
+                    outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.1, do_sample=True)
                 latency = time.perf_counter() - start
 
                 raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
                 parsed = parse_model_json(raw)
                 results.append((parsed, raw, latency))
         else:
-            # Batched — pad and generate together
             tokenizer.padding_side = "left"
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True,
-                              max_length=2048).to(model.device)
-            input_lens = [inputs["attention_mask"][i].sum().item() for i in range(len(prompts))]
+                              max_length=4096).to(model.device)
 
             start = time.perf_counter()
             with torch.no_grad():
-                outputs = model.generate(**inputs, max_new_tokens=512, temperature=0.1, do_sample=True)
+                outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.1, do_sample=True)
             total_latency = time.perf_counter() - start
             per_latency = total_latency / len(prompts)
 
@@ -373,6 +377,41 @@ def print_comparison(base_metrics: dict, ft_metrics: dict, base_results: list, f
 # Main
 # ---------------------------------------------------------------------------
 
+def load_training_context(train_file: str | None) -> None:
+    """Load system prompt and tools from the training data so eval matches training format."""
+    global EVAL_SYSTEM_PROMPT, EVAL_TOOLS
+
+    if not train_file or not os.path.exists(train_file):
+        print("  WARNING: train file not found — using generic system prompt (results may be poor)")
+        EVAL_SYSTEM_PROMPT = (
+            "You are a customer service agent. Analyze the customer message "
+            "and respond with valid JSON containing: intent, urgency, confidence, "
+            "is_valid, rejection_type, resolution_type, team, actions, summary, reasoning, response."
+        )
+        EVAL_TOOLS = None
+        return
+
+    # Read first training example to extract system prompt + tools
+    with open(train_file) as f:
+        first_line = f.readline().strip()
+        if not first_line:
+            return
+        ex = json.loads(first_line)
+
+    # Extract system prompt
+    for m in ex.get("messages", []):
+        if m.get("role") == "system":
+            EVAL_SYSTEM_PROMPT = m.get("content", "")
+            break
+
+    # Extract tools
+    EVAL_TOOLS = ex.get("tools")
+
+    prompt_preview = EVAL_SYSTEM_PROMPT[:80] + "..." if len(EVAL_SYSTEM_PROMPT) > 80 else EVAL_SYSTEM_PROMPT
+    print(f"  System prompt: {prompt_preview}")
+    print(f"  Tools: {[t['function']['name'] for t in EVAL_TOOLS] if EVAL_TOOLS else 'none'}")
+
+
 def main():
     args = parse_args()
 
@@ -381,6 +420,21 @@ def main():
     print(f"{'='*60}")
 
     tickets = load_gold_data(args.gold_file)
+
+    # Load system prompt + tools from training data
+    train_file = args.train_file
+    if not train_file or not os.path.exists(train_file or ""):
+        cfg = load_config(args.config) if os.path.exists(args.config) else {}
+        train_file = cfg.get("data", {}).get("train_file", "")
+    if not os.path.exists(train_file or ""):
+        for candidate in [
+            "/content/drive/MyDrive/kiki-slm/data/sft-data/train_trimmed.jsonl",
+            "/content/drive/MyDrive/kiki-slm/data/sft-data/train.jsonl",
+        ]:
+            if os.path.exists(candidate):
+                train_file = candidate
+                break
+    load_training_context(train_file)
 
     batch_size = args.batch_size if args.batch_size > 0 else auto_detect_batch_size()
     print(f"  Inference batch size: {batch_size}")
