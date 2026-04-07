@@ -57,7 +57,11 @@ VALID_INTENTS = {
 VALID_URGENCIES = {"low", "medium", "high", "critical"}
 VALID_RESOLUTION_TYPES = {"direct_resolve", "requires_human_action", "needs_escalation", "needs_more_info"}
 VALID_TEAMS = {"design", "logistics", "finance", "account_manager", "none"}
-VALID_COLLECTIONS = {"faq", "operations", "communication_guidelines", "supplier_data"}
+VALID_COLLECTIONS = {
+    "faq", "operations", "communication_guidelines", "supplier_data",
+    # Actual names the teacher agent uses (RAG service collection aliases)
+    "customer_policy_faq", "sales_operations_playbook", "supplier_intelligence",
+}
 # Rejection types come from the agent's ValidationReasoning Literal (5 values).
 VALID_REJECTION_TYPES = {"spam", "misdirected", "newsletter", "auto_reply", "unrelated"}
 
@@ -74,7 +78,7 @@ BANNED_RESPONSE_PHRASES = [
     "i apologize for any inconvenience",
 ]
 
-DEFAULT_MAX_SEQ_LENGTH = 4096
+DEFAULT_MAX_SEQ_LENGTH = 8192
 
 
 def extract_final_json(content: str) -> dict | None:
@@ -102,13 +106,13 @@ def extract_final_json(content: str) -> dict | None:
 
 
 def estimate_token_count(messages: list[dict]) -> int:
-    """Rough token estimate (~1 token per 3.5 chars for multilingual content)."""
+    """Rough token estimate (~1 token per 3.5 chars for English content)."""
     total_chars = 0
     for m in messages:
         total_chars += len(m.get("content", "") or "")
         for tc in m.get("tool_calls", []):
             total_chars += len(json.dumps(tc))
-    return total_chars // 3
+    return int(total_chars / 3.5)
 
 
 def extract_ticket_id(messages: list[dict]) -> str | None:

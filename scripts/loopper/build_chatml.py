@@ -942,6 +942,122 @@ def main():
     logger.info("Added %d rejection examples to eval (from %d eval-pool traces)",
                 rejections_added_eval, len(eval_rejection_traces))
 
+    # --- Trim oversized examples to fit max_seq_length ─────────────
+    # Only touches examples that exceed the limit. Under-limit examples
+    # pass through unchanged.
+    MAX_SEQ_TOKENS = 8192
+    CHARS_PER_TOKEN = 3.5
+
+    def estimate_tokens(ex: dict) -> float:
+        return sum(len(json.dumps(m)) for m in ex["messages"]) / CHARS_PER_TOKEN
+
+    def trim_to_fit(ex: dict) -> dict | None:
+        """Progressively trim an oversized example. Returns None only if
+        trimming cannot bring it under the limit."""
+        est = estimate_tokens(ex)
+        if est <= MAX_SEQ_TOKENS:
+            return ex  # already fits — no changes
+
+        msgs = ex["messages"]
+
+        # Pass 1: Truncate RAG result content (tool messages) to 700 chars each
+        for m in msgs:
+            if m["role"] == "tool" and m.get("content"):
+                try:
+                    payload = json.loads(m["content"])
+                    results = payload.get("results", [])
+                    trimmed = False
+                    for r in results:
+                        text = r.get("text", "")
+                        if len(text) > 700:
+                            r["text"] = text[:700] + "..."
+                            trimmed = True
+                    if trimmed:
+                        m["content"] = json.dumps(payload, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        if estimate_tokens(ex) <= MAX_SEQ_TOKENS:
+            return ex
+
+        # Pass 2: Reduce RAG results to top 3 per tool call
+        for m in msgs:
+            if m["role"] == "tool" and m.get("content"):
+                try:
+                    payload = json.loads(m["content"])
+                    results = payload.get("results", [])
+                    if len(results) > 3:
+                        payload["results"] = results[:3]
+                        m["content"] = json.dumps(payload, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        if estimate_tokens(ex) <= MAX_SEQ_TOKENS:
+            return ex
+
+        # Pass 3: Truncate the user message (ticket body) — keep first 3000 chars
+        for m in msgs:
+            if m["role"] == "user" and len(m.get("content", "")) > 3000:
+                m["content"] = m["content"][:3000] + "\n\n[...truncated]"
+
+        if estimate_tokens(ex) <= MAX_SEQ_TOKENS:
+            return ex
+
+        # Pass 4: Aggressive RAG trim — 150 chars each, max 2 results
+        for m in msgs:
+            if m["role"] == "tool" and m.get("content"):
+                try:
+                    payload = json.loads(m["content"])
+                    results = payload.get("results", [])
+                    for r in results:
+                        text = r.get("text", "")
+                        if len(text) > 150:
+                            r["text"] = text[:150] + "..."
+                    if len(results) > 2:
+                        payload["results"] = results[:2]
+                    m["content"] = json.dumps(payload, ensure_ascii=False)
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+
+        if estimate_tokens(ex) <= MAX_SEQ_TOKENS:
+            return ex
+
+        # Pass 5: Truncate user message harder — 2000 chars
+        for m in msgs:
+            if m["role"] == "user" and len(m.get("content", "")) > 2000:
+                m["content"] = m["content"][:2000] + "\n\n[...truncated]"
+
+        if estimate_tokens(ex) <= MAX_SEQ_TOKENS:
+            return ex
+
+        # Still over — drop as last resort
+        return None
+
+    trimmed_count = 0
+    dropped_count = 0
+    all_sets = [("train", train_examples), ("eval", eval_examples)]
+    for label, examples in all_sets:
+        kept = []
+        for ex in examples:
+            result = trim_to_fit(ex)
+            if result is None:
+                dropped_count += 1
+            elif result is not ex:
+                trimmed_count += 1
+                kept.append(result)
+            else:
+                kept.append(result)
+        if label == "train":
+            train_examples = kept
+        else:
+            eval_examples = kept
+
+    if trimmed_count or dropped_count:
+        logger.info(
+            "Token limit (%d): trimmed %d examples, dropped %d (could not fit)",
+            MAX_SEQ_TOKENS, trimmed_count, dropped_count,
+        )
+
     random.shuffle(train_examples)
 
     # Write JSONL

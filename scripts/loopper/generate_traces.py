@@ -292,7 +292,9 @@ async def generate_single_trace(
                 return {"ticket_id": ticket_id, "status": "skipped", "reason": "no_messages"}
 
             t0 = time.monotonic()
-            result = await graph.ainvoke(input_state)
+            # 5-min timeout per ticket — pilot max was 103s, so 300s is generous.
+            # Prevents one stuck ticket from blocking the entire batch.
+            result = await asyncio.wait_for(graph.ainvoke(input_state), timeout=300)
             elapsed_ms = (time.monotonic() - t0) * 1000
 
             trace = extract_trace_from_state(result, input_state)
@@ -309,6 +311,10 @@ async def generate_single_trace(
                 "elapsed_ms": elapsed_ms,
             }
 
+        except asyncio.TimeoutError:
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            logger.error("Ticket %s timed out after %.0fs", ticket_id, elapsed_ms / 1000)
+            return {"ticket_id": ticket_id, "status": "error", "error": "timeout_300s"}
         except Exception as e:
             logger.error("Failed on ticket %s: %s", ticket_id, e)
             return {"ticket_id": ticket_id, "status": "error", "error": str(e)}

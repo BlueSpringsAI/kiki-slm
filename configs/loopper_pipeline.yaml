@@ -82,6 +82,10 @@ chatml:
       - operations
       - communication_guidelines
       - supplier_data
+      # Aliases the teacher agent actually uses
+      - customer_policy_faq
+      - sales_operations_playbook
+      - supplier_intelligence
     default_top_k: 5
 
   # Category-specific KB search plans
@@ -172,7 +176,7 @@ chatml:
 # (no scripts read from it at runtime; the validator hard-codes the same
 # values in Python). Keep in sync if the code changes.
 validation:
-  max_seq_length: 4096
+  max_seq_length: 8192
   strict: false
 
   # 11 Loopper business intents — the agent's TicketCategory enum.
