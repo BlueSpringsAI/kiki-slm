@@ -372,6 +372,28 @@ def main():
     # Trainer
     from trl import SFTConfig, SFTTrainer
 
+    # Estimate total steps to auto-scale eval/save frequency
+    # With packing, actual steps are much less than len(dataset)/batch.
+    # We estimate conservatively, then adjust after trainer is created.
+    effective_batch = batch_size * grad_accum
+    estimated_steps_per_epoch = max(1, len(train_dataset) // effective_batch)
+    estimated_total_steps = estimated_steps_per_epoch * c["epochs"]
+
+    # Auto-scale: eval/save at ~5 evenly spaced points during training, minimum every 10 steps
+    config_save_steps = c["save_steps"]
+    config_eval_steps = c["eval_steps"]
+    config_logging_steps = c["logging_steps"]
+
+    if estimated_total_steps < config_save_steps * 2:
+        # Total steps too small for default frequency — auto-scale
+        auto_interval = max(10, estimated_total_steps // 5)
+        config_save_steps = auto_interval
+        config_eval_steps = auto_interval
+        config_logging_steps = max(1, auto_interval // 5)
+        print(f"  Auto-scaled: save/eval every {auto_interval} steps, log every {config_logging_steps} (est. {estimated_total_steps} total steps)")
+    else:
+        print(f"  Save/eval every {config_save_steps} steps (est. {estimated_total_steps} total steps)")
+
     training_args = SFTConfig(
         output_dir=c["output_dir"], dataset_text_field="text", packing=c["packing"],
         per_device_train_batch_size=batch_size, gradient_accumulation_steps=grad_accum,
@@ -380,9 +402,9 @@ def main():
         bf16=torch.cuda.is_bf16_supported(), fp16=not torch.cuda.is_bf16_supported(),
         optim=c["optim"], weight_decay=c["weight_decay"], max_seq_length=c["max_seq_length"],
         gradient_checkpointing=True, gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=c["logging_steps"], logging_first_step=True,
-        save_strategy="steps", save_steps=c["save_steps"], save_total_limit=c["save_total_limit"],
-        eval_strategy="steps", eval_steps=c["eval_steps"],
+        logging_steps=config_logging_steps, logging_first_step=True,
+        save_strategy="steps", save_steps=config_save_steps, save_total_limit=c["save_total_limit"],
+        eval_strategy="steps", eval_steps=config_eval_steps,
         disable_tqdm=False, report_to=report_to, seed=c["seed"], dataloader_pin_memory=True,
     )
 
