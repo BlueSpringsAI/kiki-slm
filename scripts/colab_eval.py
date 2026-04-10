@@ -58,6 +58,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-file", default=None)
     parser.add_argument("--max-seq-length", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument(
+        "--max-turns", type=int, default=DEFAULT_MAX_TURNS,
+        help="Max generation turns per example (tool_call loop). Default: 4.",
+    )
+    parser.add_argument(
+        "--save-trajectory", action="store_true",
+        help="Include full multi-turn trajectory in the saved JSON (large).",
+    )
 
     args = parser.parse_args()
 
@@ -108,19 +116,102 @@ def load_gold_data(path: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# JSON parsing (strips <think> tokens)
+# Output parsing
 # ---------------------------------------------------------------------------
 
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+
+def _extract_balanced_json(text: str) -> dict | None:
+    """Find the first `{...}` with balanced braces and parse it."""
+    first = text.find("{")
+    if first == -1:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(first, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\" and in_str:
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[first:i + 1])
+                except json.JSONDecodeError:
+                    return None
+    return None
+
+
 def parse_model_json(raw_text: str) -> dict | None:
+    """Strip <think>/<tool_call> blocks and extract the final JSON response."""
     text = raw_text.strip()
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text = _THINK_RE.sub("", text).strip()
+    text = _TOOL_CALL_RE.sub("", text).strip()
     if text.startswith("```"):
         lines = [l for l in text.split("\n") if not l.strip().startswith("```")]
         text = "\n".join(lines).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return None
+        return _extract_balanced_json(text)
+
+
+def parse_assistant_output(raw_text: str) -> dict:
+    """Parse raw model output into an assistant message dict.
+
+    Returns a dict with keys: role, content, reasoning_content, tool_calls.
+    This matches the training-data format so we can feed it back to the
+    chat template as conversation history for multi-turn generation.
+    """
+    text = raw_text.strip()
+
+    # Extract <think>...</think> as reasoning_content
+    think_match = _THINK_RE.search(text)
+    reasoning = think_match.group(1).strip() if think_match else ""
+    text_no_think = _THINK_RE.sub("", text).strip()
+
+    # Extract <tool_call>...</tool_call> blocks
+    tool_calls: list[dict] = []
+    for idx, tc_body in enumerate(_TOOL_CALL_RE.findall(text_no_think)):
+        try:
+            tc = json.loads(tc_body.strip())
+        except json.JSONDecodeError:
+            continue
+        name = tc.get("name") or tc.get("function", {}).get("name", "")
+        args = tc.get("arguments", tc.get("function", {}).get("arguments", {}))
+        if isinstance(args, dict):
+            args_str = json.dumps(args, ensure_ascii=False)
+        else:
+            args_str = str(args)
+        tool_calls.append({
+            "type": "function",
+            "id": f"call_eval_{idx}",
+            "function": {"name": name, "arguments": args_str},
+        })
+
+    # Content = whatever remains after stripping think + tool_call blocks
+    content = _TOOL_CALL_RE.sub("", text_no_think).strip()
+
+    msg: dict = {"role": "assistant", "content": content}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -142,93 +233,194 @@ def auto_detect_batch_size() -> int:
 
 
 # ---------------------------------------------------------------------------
-# Batched inference
+# Multi-turn inference (simulates rag_search tool loop)
 # ---------------------------------------------------------------------------
 
-def run_batched_inference(
-    model, tokenizer, messages: list[str], batch_size: int,
-) -> list[tuple[dict | None, str, float]]:
-    """Run inference in batches for faster evaluation on high-VRAM GPUs.
+# Max generations per example before giving up. Most training traces have
+# 1-3 tool calls before the final JSON, so 4 turns is plenty.
+DEFAULT_MAX_TURNS = 4
+DEFAULT_MAX_NEW_TOKENS = 1024
 
-    Uses EVAL_SYSTEM_PROMPT and EVAL_TOOLS (loaded from training data in main()).
+
+def _apply_template(tokenizer, chat_msgs: list[dict]) -> str:
+    """Apply chat template with tools, falling back gracefully if tools param rejected."""
+    try:
+        return tokenizer.apply_chat_template(
+            chat_msgs,
+            tools=EVAL_TOOLS,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return tokenizer.apply_chat_template(
+            chat_msgs, tokenize=False, add_generation_prompt=True,
+        )
+
+
+def _generate_batch(
+    model, tokenizer, prompts: list[str], max_new_tokens: int,
+) -> tuple[list[str], list[float]]:
+    """Generate continuations for a list of prompts. Returns (raw_outputs, per_example_latencies)."""
+    if len(prompts) == 1:
+        inputs = tokenizer(prompts[0], return_tensors="pt").to(model.device)
+        input_len = inputs["input_ids"].shape[1]
+        start = time.perf_counter()
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+        latency = time.perf_counter() - start
+        raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+        return [raw], [latency]
+
+    tokenizer.padding_side = "left"
+    inputs = tokenizer(
+        prompts, return_tensors="pt", padding=True, truncation=True, max_length=4096,
+    ).to(model.device)
+    input_len = inputs["input_ids"].shape[1]
+    start = time.perf_counter()
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    total_latency = time.perf_counter() - start
+    per_latency = total_latency / len(prompts)
+    raws = [
+        tokenizer.decode(outputs[i][input_len:], skip_special_tokens=True)
+        for i in range(len(prompts))
+    ]
+    tokenizer.padding_side = "right"
+    return raws, [per_latency] * len(prompts)
+
+
+def run_multiturn_inference(
+    model,
+    tokenizer,
+    messages: list[str],
+    batch_size: int,
+    max_turns: int = DEFAULT_MAX_TURNS,
+    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+) -> list[dict]:
+    """Run multi-turn generation: feeds empty tool results back when the model emits <tool_call>.
+
+    For each example the loop runs until the model emits a turn with NO tool_calls
+    (final JSON) or until max_turns is reached. Within each turn active examples
+    are batched together for throughput.
+
+    Returns a list of dicts, one per input message:
+        {"parsed": dict|None, "final_raw": str, "total_raw": str,
+         "latency": float, "turns": int, "tool_call_names": list[str]}
     """
-    global EVAL_SYSTEM_PROMPT, EVAL_TOOLS
-    results = []
-    max_new_tokens = 1024  # Loopper 11-field output is longer than generic
-
-    for batch_start in range(0, len(messages), batch_size):
-        batch_msgs = messages[batch_start:batch_start + batch_size]
-
-        # Build prompts — pass tools so model sees the tool schema
-        prompts = []
-        for msg in batch_msgs:
-            chat_msgs = [
+    # Per-example state
+    states: list[dict] = []
+    for msg in messages:
+        states.append({
+            "chat_msgs": [
                 {"role": "system", "content": EVAL_SYSTEM_PROMPT},
                 {"role": "user", "content": msg},
-            ]
-            try:
-                prompt = tokenizer.apply_chat_template(
-                    chat_msgs,
-                    tools=EVAL_TOOLS,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-            except Exception:
-                # Fallback without tools
-                prompt = tokenizer.apply_chat_template(
-                    chat_msgs, tokenize=False, add_generation_prompt=True,
-                )
-            prompts.append(prompt)
+            ],
+            "done": False,
+            "final_raw": "",
+            "total_raw_parts": [],
+            "latency": 0.0,
+            "turns": 0,
+            "tool_call_names": [],
+        })
 
-        if batch_size == 1 or len(prompts) == 1:
-            for prompt in prompts:
-                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-                input_len = inputs["input_ids"].shape[1]
+    for turn in range(max_turns):
+        active = [i for i, s in enumerate(states) if not s["done"]]
+        if not active:
+            break
 
-                start = time.perf_counter()
-                with torch.no_grad():
-                    outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.1, do_sample=True)
-                latency = time.perf_counter() - start
+        # Batch active examples
+        for bstart in range(0, len(active), batch_size):
+            batch_ids = active[bstart:bstart + batch_size]
+            prompts = [_apply_template(tokenizer, states[i]["chat_msgs"]) for i in batch_ids]
+            raws, lats = _generate_batch(model, tokenizer, prompts, max_new_tokens)
 
-                raw = tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
-                parsed = parse_model_json(raw)
-                results.append((parsed, raw, latency))
-        else:
-            tokenizer.padding_side = "left"
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True,
-                              max_length=4096).to(model.device)
+            for j, i in enumerate(batch_ids):
+                raw = raws[j]
+                s = states[i]
+                s["final_raw"] = raw
+                s["total_raw_parts"].append(f"--- turn {turn + 1} ---\n{raw}")
+                s["latency"] += lats[j]
+                s["turns"] += 1
 
-            start = time.perf_counter()
-            with torch.no_grad():
-                outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, temperature=0.1, do_sample=True)
-            total_latency = time.perf_counter() - start
-            per_latency = total_latency / len(prompts)
+                assistant_msg = parse_assistant_output(raw)
+                tcs = assistant_msg.get("tool_calls") or []
 
-            for i in range(len(prompts)):
-                raw = tokenizer.decode(outputs[i][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-                parsed = parse_model_json(raw)
-                results.append((parsed, raw, per_latency))
+                if tcs:
+                    # Record tool call names for diagnostics
+                    for tc in tcs:
+                        s["tool_call_names"].append(tc["function"]["name"])
+                    # Append assistant turn + synthetic empty tool results
+                    s["chat_msgs"].append(assistant_msg)
+                    for tc in tcs:
+                        s["chat_msgs"].append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "content": json.dumps({"results": []}),
+                        })
+                else:
+                    # No tool calls → this is the final response
+                    s["done"] = True
 
-            tokenizer.padding_side = "right"
-
+    results: list[dict] = []
+    for s in states:
+        parsed = parse_model_json(s["final_raw"])
+        results.append({
+            "parsed": parsed,
+            "final_raw": s["final_raw"],
+            "total_raw": "\n".join(s["total_raw_parts"]),
+            "latency": s["latency"],
+            "turns": s["turns"],
+            "tool_call_names": s["tool_call_names"],
+        })
     return results
 
 
-def evaluate_model(model, tokenizer, tickets: list[dict], label: str, batch_size: int) -> list[dict]:
-    """Run a model on all gold tickets with batched inference."""
+def evaluate_model(
+    model, tokenizer, tickets: list[dict], label: str, batch_size: int,
+    max_turns: int = DEFAULT_MAX_TURNS,
+) -> list[dict]:
+    """Run a model on all gold tickets with multi-turn tool-call simulation."""
     messages = [t["customer_message"] for t in tickets]
     total = len(tickets)
 
-    print(f"    Running {label} inference (batch_size={batch_size})...")
+    print(f"    Running {label} inference (batch_size={batch_size}, max_turns={max_turns})...")
     start = time.perf_counter()
-    infer_results = run_batched_inference(model, tokenizer, messages, batch_size)
+    infer_results = run_multiturn_inference(
+        model, tokenizer, messages, batch_size, max_turns=max_turns,
+    )
     total_time = time.perf_counter() - start
-    print(f"    Completed {total} tickets in {total_time:.1f}s ({total_time/total:.2f}s/ticket avg)")
+
+    avg_turns = sum(r["turns"] for r in infer_results) / max(1, len(infer_results))
+    print(
+        f"    Completed {total} tickets in {total_time:.1f}s "
+        f"({total_time / total:.2f}s/ticket avg, {avg_turns:.2f} turns avg)"
+    )
 
     results = []
-    for i, (parsed, raw, latency) in enumerate(infer_results):
-        tid = tickets[i].get("ticket_id", f"ticket_{i+1}")
-        results.append({"ticket_id": tid, "parsed": parsed, "raw": raw, "latency": latency})
+    for i, r in enumerate(infer_results):
+        tid = tickets[i].get("ticket_id", f"ticket_{i + 1}")
+        results.append({
+            "ticket_id": tid,
+            "parsed": r["parsed"],
+            "raw": r["final_raw"],
+            "trajectory": r["total_raw"],
+            "latency": r["latency"],
+            "turns": r["turns"],
+            "tool_call_names": r["tool_call_names"],
+        })
     return results
 
 
@@ -236,79 +428,109 @@ def evaluate_model(model, tokenizer, tickets: list[dict], label: str, batch_size
 # Metrics
 # ---------------------------------------------------------------------------
 
-def workflow_step_overlap(pred_steps: list[str], gold_steps: list[str]) -> float:
-    """Compute normalized overlap between predicted and gold workflow steps.
+def _norm(v) -> str:
+    """Normalize a value for comparison (handles None → empty string)."""
+    if v is None:
+        return ""
+    return str(v).strip().lower()
 
-    Uses set-based Jaccard similarity on lowercased step names.
-    Returns 0.0-1.0 where 1.0 = perfect match.
-    """
-    if not gold_steps and not pred_steps:
+
+def _set_f1(pred: list[str], gold: list[str]) -> float:
+    """F1 between two sets of strings (lowercased)."""
+    if not gold and not pred:
         return 1.0
-    if not gold_steps or not pred_steps:
+    if not gold or not pred:
         return 0.0
-    pred_set = {s.strip().lower() for s in pred_steps}
-    gold_set = {s.strip().lower() for s in gold_steps}
-    intersection = pred_set & gold_set
-    union = pred_set | gold_set
-    return len(intersection) / len(union) if union else 0.0
+    p = {s.strip().lower() for s in pred if s}
+    g = {s.strip().lower() for s in gold if s}
+    tp = len(p & g)
+    if tp == 0:
+        return 0.0
+    precision = tp / len(p)
+    recall = tp / len(g)
+    return 2 * precision * recall / (precision + recall)
 
 
-def tool_set_f1(pred_tools: list[str], gold_tools: list[str]) -> float:
-    """Compute F1 between predicted and gold tool sets."""
-    if not gold_tools and not pred_tools:
-        return 1.0
-    if not gold_tools or not pred_tools:
-        return 0.0
-    pred_set = {t.strip().lower() for t in pred_tools}
-    gold_set = {t.strip().lower() for t in gold_tools}
-    tp = len(pred_set & gold_set)
-    precision = tp / len(pred_set) if pred_set else 0.0
-    recall = tp / len(gold_set) if gold_set else 0.0
-    return (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+def _extract_pred_tool_names(res: dict) -> list[str]:
+    """Collect tool call names the model actually invoked during the turn loop."""
+    return [n for n in (res.get("tool_call_names") or []) if n]
+
+
+def _extract_gold_tool_names(ticket: dict) -> list[str]:
+    """Pull tool names from gold_tool_calls (list of {name, collection, query})."""
+    out = []
+    for tc in ticket.get("gold_tool_calls", []) or []:
+        name = tc.get("name") if isinstance(tc, dict) else None
+        if name:
+            out.append(name)
+    return out
 
 
 def compute_metrics(results: list[dict], tickets: list[dict]) -> dict:
     n = len(results)
-    intent_correct = urgency_correct = json_valid = 0
-    workflow_scores = []
-    tool_scores = []
-    latencies = []
+    intent_correct = 0
+    urgency_correct = 0
+    is_valid_correct = 0
+    rejection_correct = 0
+    rejection_evaluated = 0
+    resolution_correct = 0
+    team_correct = 0
+    json_valid = 0
+    tool_f1_scores: list[float] = []
+    latencies: list[float] = []
+    turns_list: list[int] = []
 
     for res, ticket in zip(results, tickets):
-        p = res["parsed"]
-        latencies.append(res["latency"])
-        if p is not None:
-            json_valid += 1
-            # Intent (with secondary)
-            pred_intent = p.get("intent", "").lower()
-            gold_intent = ticket.get("gold_intent", "").lower()
-            gold_secondary = ticket.get("gold_intent_secondary", "").lower()
-            if pred_intent == gold_intent or (gold_secondary and pred_intent == gold_secondary):
-                intent_correct += 1
-            # Urgency
-            if p.get("urgency", "").lower() == ticket.get("gold_urgency", "").lower():
-                urgency_correct += 1
-            # Workflow steps
-            gold_steps = ticket.get("gold_workflow_steps", [])
-            pred_steps = p.get("workflow_steps", [])
-            if gold_steps:
-                workflow_scores.append(workflow_step_overlap(pred_steps, gold_steps))
-            # Tool selection
-            gold_tools = ticket.get("gold_tools_required", [])
-            pred_tools = p.get("tools_required", [])
-            if gold_tools:
-                tool_scores.append(tool_set_f1(pred_tools, gold_tools))
+        latencies.append(res.get("latency", 0.0))
+        turns_list.append(res.get("turns", 0))
+
+        # Tool-name F1 is computed from the model's actual tool calls — works
+        # even when final JSON fails to parse.
+        gold_tools = _extract_gold_tool_names(ticket)
+        pred_tools = _extract_pred_tool_names(res)
+        if gold_tools or pred_tools:
+            tool_f1_scores.append(_set_f1(pred_tools, gold_tools))
+
+        p = res.get("parsed")
+        if p is None:
+            continue
+        json_valid += 1
+
+        if _norm(p.get("intent")) == _norm(ticket.get("gold_intent")):
+            intent_correct += 1
+        if _norm(p.get("urgency")) == _norm(ticket.get("gold_urgency")):
+            urgency_correct += 1
+        if p.get("is_valid") == ticket.get("gold_is_valid"):
+            is_valid_correct += 1
+        if _norm(p.get("resolution_type")) == _norm(ticket.get("gold_resolution_type")):
+            resolution_correct += 1
+        if _norm(p.get("team")) == _norm(ticket.get("gold_team")):
+            team_correct += 1
+
+        # rejection_type only matters for is_valid=false rows
+        if ticket.get("gold_is_valid") is False:
+            rejection_evaluated += 1
+            if _norm(p.get("rejection_type")) == _norm(ticket.get("gold_rejection_type")):
+                rejection_correct += 1
 
     return {
-        "intent_accuracy": intent_correct / n if n else 0,
-        "urgency_accuracy": urgency_correct / n if n else 0,
-        "workflow_accuracy": sum(workflow_scores) / len(workflow_scores) if workflow_scores else 0,
-        "tool_f1": sum(tool_scores) / len(tool_scores) if tool_scores else 0,
-        "json_parse_rate": json_valid / n if n else 0,
-        "avg_latency_s": sum(latencies) / len(latencies) if latencies else 0,
+        "intent_accuracy": intent_correct / n if n else 0.0,
+        "urgency_accuracy": urgency_correct / n if n else 0.0,
+        "is_valid_accuracy": is_valid_correct / n if n else 0.0,
+        "resolution_accuracy": resolution_correct / n if n else 0.0,
+        "team_accuracy": team_correct / n if n else 0.0,
+        "rejection_accuracy": (
+            rejection_correct / rejection_evaluated if rejection_evaluated else 0.0
+        ),
+        "tool_name_f1": (
+            sum(tool_f1_scores) / len(tool_f1_scores) if tool_f1_scores else 0.0
+        ),
+        "json_parse_rate": json_valid / n if n else 0.0,
+        "avg_latency_s": sum(latencies) / len(latencies) if latencies else 0.0,
+        "avg_turns": sum(turns_list) / len(turns_list) if turns_list else 0.0,
         "total": n,
-        "workflow_evaluated": len(workflow_scores),
-        "tools_evaluated": len(tool_scores),
+        "rejection_evaluated": rejection_evaluated,
+        "tools_evaluated": len(tool_f1_scores),
     }
 
 
@@ -336,22 +558,33 @@ def print_comparison(base_metrics: dict, ft_metrics: dict, base_results: list, f
     print(f"  {'Metric':<28s} {'Base Qwen3':>15s} {'Fine-tuned':>15s}")
     print(f"  {'-'*58}")
 
-    for key, label, fmt in [
+    metric_rows = [
         ("intent_accuracy", "Intent Accuracy", "{:.1%}"),
         ("urgency_accuracy", "Urgency Accuracy", "{:.1%}"),
-        ("workflow_accuracy", "Workflow Accuracy", "{:.1%}"),
-        ("tool_f1", "Tool Selection F1", "{:.1%}"),
+        ("is_valid_accuracy", "is_valid Accuracy", "{:.1%}"),
+        ("rejection_accuracy", "Rejection-type Acc", "{:.1%}"),
+        ("resolution_accuracy", "Resolution-type Acc", "{:.1%}"),
+        ("team_accuracy", "Team Accuracy", "{:.1%}"),
+        ("tool_name_f1", "Tool-name F1", "{:.1%}"),
         ("json_parse_rate", "JSON Parse Rate", "{:.1%}"),
         ("avg_latency_s", "Avg Latency (s)", "{:.2f}"),
-    ]:
+        ("avg_turns", "Avg Turns", "{:.2f}"),
+    ]
+    for key, label, fmt in metric_rows:
         bv = fmt.format(base_metrics.get(key, 0))
         fv = fmt.format(ft_metrics.get(key, 0))
         print(f"  {label:<28s} {bv:>15s} {fv:>15s}")
 
     print(f"{'='*65}")
-
-    for key, label in [("intent_accuracy", "Intent"), ("urgency_accuracy", "Urgency"),
-                        ("workflow_accuracy", "Workflow"), ("tool_f1", "Tool F1"), ("json_parse_rate", "JSON Parse")]:
+    for key, label in [
+        ("intent_accuracy", "Intent"),
+        ("urgency_accuracy", "Urgency"),
+        ("is_valid_accuracy", "is_valid"),
+        ("resolution_accuracy", "Resolution"),
+        ("team_accuracy", "Team"),
+        ("tool_name_f1", "Tool F1"),
+        ("json_parse_rate", "JSON Parse"),
+    ]:
         diff = ft_metrics.get(key, 0) - base_metrics.get(key, 0)
         arrow = "+" if diff >= 0 else ""
         print(f"  {label} improvement: {arrow}{diff:.1%}")
@@ -366,11 +599,17 @@ def print_comparison(base_metrics: dict, ft_metrics: dict, base_results: list, f
         b_intent = b["parsed"].get("intent", "PARSE_FAIL") if b["parsed"] else "PARSE_FAIL"
         f_intent = f["parsed"].get("intent", "PARSE_FAIL") if f["parsed"] else "PARSE_FAIL"
         gold = ticket.get("gold_intent", "?")
-        b_ok = "Y" if b_intent.lower() == gold.lower() else "N"
-        f_ok = "Y" if f_intent.lower() == gold.lower() else "N"
+        b_ok = "Y" if _norm(b_intent) == _norm(gold) else "N"
+        f_ok = "Y" if _norm(f_intent) == _norm(gold) else "N"
         print(f"\n  {tid} | Gold: {gold}")
-        print(f"    Base:       {b_intent} [{b_ok}] ({b['latency']:.2f}s)")
-        print(f"    Fine-tuned: {f_intent} [{f_ok}] ({f['latency']:.2f}s)")
+        print(
+            f"    Base:       {b_intent} [{b_ok}] "
+            f"({b['latency']:.2f}s, {b.get('turns', 0)} turns, tools={b.get('tool_call_names', [])})"
+        )
+        print(
+            f"    Fine-tuned: {f_intent} [{f_ok}] "
+            f"({f['latency']:.2f}s, {f.get('turns', 0)} turns, tools={f.get('tool_call_names', [])})"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +689,9 @@ def main():
     )
     FastLanguageModel.for_inference(base_model)
 
-    base_results = evaluate_model(base_model, base_tokenizer, tickets, "Base", batch_size)
+    base_results = evaluate_model(
+        base_model, base_tokenizer, tickets, "Base", batch_size, max_turns=args.max_turns,
+    )
 
     print(f"  Freeing base model VRAM...")
     free_model(base_model)
@@ -466,7 +707,9 @@ def main():
     )
     FastLanguageModel.for_inference(ft_model)
 
-    ft_results = evaluate_model(ft_model, ft_tokenizer, tickets, "Fine-tuned", batch_size)
+    ft_results = evaluate_model(
+        ft_model, ft_tokenizer, tickets, "Fine-tuned", batch_size, max_turns=args.max_turns,
+    )
 
     free_model(ft_model)
     del ft_tokenizer
@@ -483,11 +726,22 @@ def main():
         output_file = str(Path(args.adapter_path) / "eval_results.json")
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
 
+    def _serialize(results: list[dict]) -> list[dict]:
+        skip = {"trajectory"} if not args.save_trajectory else set()
+        return [{k: v for k, v in r.items() if k not in skip} for r in results]
+
     output = {
+        "config": {
+            "adapter_path": args.adapter_path,
+            "base_model": args.base_model,
+            "gold_file": args.gold_file,
+            "batch_size": batch_size,
+            "max_turns": args.max_turns,
+        },
         "base_metrics": base_metrics,
         "ft_metrics": ft_metrics,
-        "base_results": [{k: v for k, v in r.items() if k != "raw"} for r in base_results],
-        "ft_results": [{k: v for k, v in r.items() if k != "raw"} for r in ft_results],
+        "base_results": _serialize(base_results),
+        "ft_results": _serialize(ft_results),
     }
     with open(output_file, "w") as f:
         json.dump(output, f, indent=2, default=str)
