@@ -1,0 +1,87 @@
+{
+  "_comment": "ECS Fargate task definition for the Kiki Ollama sidecar. Replace ACCOUNT, REGION, YOUR-BUCKET, and the two IAM role ARNs before registering. Register with: aws ecs register-task-definition --cli-input-json file://task-definition.json",
+  "family": "kiki-ollama",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "2048",
+  "memory": "6144",
+  "runtimePlatform": {
+    "cpuArchitecture": "X86_64",
+    "operatingSystemFamily": "LINUX"
+  },
+  "executionRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::ACCOUNT:role/kiki-ollama-task-role",
+  "containerDefinitions": [
+    {
+      "name": "ollama",
+      "image": "ACCOUNT.dkr.ecr.REGION.amazonaws.com/kiki-ollama:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 11434,
+          "hostPort": 11434,
+          "protocol": "tcp",
+          "name": "ollama",
+          "appProtocol": "http"
+        }
+      ],
+      "environment": [
+        {
+          "name": "KIKI_GGUF_S3_URI",
+          "value": "s3://YOUR-BUCKET/kiki-sft-v1-Q4_K_M.gguf"
+        },
+        {
+          "name": "KIKI_MODEL_NAME",
+          "value": "kiki-sft-v1"
+        },
+        {
+          "name": "KIKI_GGUF_PATH",
+          "value": "/models/kiki.gguf"
+        },
+        {
+          "name": "OLLAMA_HOST",
+          "value": "0.0.0.0:11434"
+        },
+        {
+          "name": "OLLAMA_KEEP_ALIVE",
+          "value": "1h"
+        },
+        {
+          "name": "OLLAMA_NUM_PARALLEL",
+          "value": "2"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "REGION"
+        }
+      ],
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:11434/api/tags >/dev/null 2>&1 || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 180
+      },
+      "stopTimeout": 30,
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/kiki-ollama",
+          "awslogs-region": "REGION",
+          "awslogs-stream-prefix": "ecs",
+          "awslogs-create-group": "true"
+        }
+      },
+      "ulimits": [
+        {
+          "name": "nofile",
+          "softLimit": 65535,
+          "hardLimit": 65535
+        }
+      ]
+    }
+  ]
+}

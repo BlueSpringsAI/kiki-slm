@@ -1,0 +1,14 @@
+# Kiki SLM Modelfile — consumed by entrypoint.sh at container boot.
+# The __KIKI_GGUF_PATH__ placeholder is rewritten to the real /models/kiki.gguf
+# path by entrypoint.sh before `ollama create` is called.
+
+FROM __KIKI_GGUF_PATH__
+
+# Low temperature for deterministic structured JSON output
+PARAMETER temperature 0.1
+# Matches training max_seq_length (4096 — keep in sync!)
+PARAMETER num_ctx 4096
+# Max tokens per generation turn — the 11-field JSON + reasoning fits comfortably
+PARAMETER num_predict 1024
+# Qwen3 chat template end-of-turn marker
+PARAMETER stop "<|im_end|>"
