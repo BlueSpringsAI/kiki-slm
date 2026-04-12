@@ -154,6 +154,14 @@ def fake_rag_search(args: dict) -> dict:
 # Multi-turn invoke
 # ---------------------------------------------------------------------------
 
+def _build_endpoint(base_url: str) -> str:
+    """Normalize base URL to /v1/chat/completions (works for Ollama + vLLM)."""
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
 def invoke_kiki(
     client: httpx.Client,
     endpoint: str,
@@ -162,34 +170,41 @@ def invoke_kiki(
     max_turns: int = 4,
     verbose: bool = False,
 ) -> tuple[dict | None, list[dict]]:
-    """Run the multi-turn tool loop against Ollama. Returns (parsed_json, trajectory).
+    """Run the multi-turn tool loop via OpenAI-compat API.
 
-    trajectory is a list of per-turn dicts for debugging / printing.
+    Works against both Ollama (/v1/chat/completions) and vLLM.
+    Returns (parsed_json, trajectory).
     """
     messages = [
         {"role": "system", "content": KIKI_SYSTEM_PROMPT},
         {"role": "user", "content": ticket_text},
     ]
     trajectory: list[dict] = []
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer kiki"}
 
     for turn in range(max_turns):
         payload = {
             "model": model,
             "messages": messages,
             "tools": KIKI_TOOLS,
+            "temperature": 0.1,
+            "max_tokens": 1024,
             "stream": False,
-            "options": {"temperature": 0.1, "num_ctx": 4096, "num_predict": 1024},
         }
         t0 = time.perf_counter()
         try:
-            resp = client.post(endpoint, json=payload)
+            resp = client.post(endpoint, json=payload, headers=headers)
             resp.raise_for_status()
         except httpx.HTTPError as e:
             return None, trajectory + [{"turn": turn + 1, "error": str(e)}]
         latency = time.perf_counter() - t0
 
         data = resp.json()
-        msg = data.get("message") or {}
+        try:
+            msg = data["choices"][0]["message"]
+        except (KeyError, IndexError):
+            return None, trajectory + [{"turn": turn + 1, "error": f"bad response: {str(data)[:300]}"}]
+
         content = msg.get("content") or ""
         tool_calls = msg.get("tool_calls") or []
 
@@ -214,13 +229,15 @@ def invoke_kiki(
             parsed = parse_final_json(content)
             return parsed, trajectory
 
-        # Append assistant + fake tool results, loop
+        # Append assistant turn (with tool_calls) to history
         messages.append({
             "role": "assistant",
             "content": content,
             "tool_calls": tool_calls,
         })
+        # Append fake tool results — one per tool_call with matching ID
         for tc in tool_calls:
+            tc_id = tc.get("id") or f"call_{turn}"
             fn = tc.get("function") or {}
             args = fn.get("arguments") or {}
             if isinstance(args, str):
@@ -231,6 +248,8 @@ def invoke_kiki(
             result = fake_rag_search(args)
             messages.append({
                 "role": "tool",
+                "tool_call_id": tc_id,
+                "name": fn.get("name", "rag_search"),
                 "content": json.dumps(result, ensure_ascii=False),
             })
 
@@ -314,7 +333,7 @@ def main() -> None:
             if len(tickets) >= args.limit:
                 break
 
-    endpoint = f"{args.url.rstrip('/')}/api/chat"
+    endpoint = _build_endpoint(args.url)
 
     print(f"{'=' * 70}")
     print(f"  KIKI SMOKE TEST")
@@ -327,19 +346,28 @@ def main() -> None:
     # Check Ollama is reachable + model exists
     with httpx.Client(timeout=10.0) as client:
         try:
-            r = client.get(f"{args.url.rstrip('/')}/api/tags")
+            r = client.get(f"{args.url.rstrip('/')}/v1/models")
             r.raise_for_status()
-        except httpx.HTTPError as e:
-            print(f"ERROR: can't reach Ollama at {args.url}: {e}")
-            sys.exit(2)
-        tags = r.json().get("models", [])
-        tag_names = [t.get("name", "") for t in tags]
-        if not any(args.model in name for name in tag_names):
-            print(f"ERROR: model '{args.model}' not found in Ollama")
-            print(f"  Available: {tag_names}")
-            print(f"  Run: ollama create {args.model} -f Modelfile")
-            sys.exit(3)
-        print(f"  ✓ Ollama reachable, model '{args.model}' loaded")
+        except httpx.HTTPError:
+            # Fallback: try Ollama-native /api/tags
+            try:
+                r = client.get(f"{args.url.rstrip('/')}/api/tags")
+                r.raise_for_status()
+            except httpx.HTTPError as e:
+                print(f"ERROR: can't reach inference server at {args.url}: {e}")
+                sys.exit(2)
+        data = r.json()
+        # OpenAI format: {"data": [{"id": "model-name"}]}
+        # Ollama format: {"models": [{"name": "model-name"}]}
+        model_ids = []
+        for m in data.get("data", data.get("models", [])):
+            model_ids.append(m.get("id") or m.get("name") or "")
+        if not any(args.model in mid for mid in model_ids):
+            print(f"WARNING: model '{args.model}' not found in server model list")
+            print(f"  Available: {model_ids}")
+            print(f"  Proceeding anyway — server may still accept the name...")
+        else:
+            print(f"  ✓ Server reachable, model '{args.model}' found")
         print()
 
     # Run
