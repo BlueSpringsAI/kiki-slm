@@ -97,9 +97,14 @@ def main() -> None:
     # ------------------------------------------------------------------
     # 3. Export GGUF (Q4_K_M by default, ~2.6 GB)
     # ------------------------------------------------------------------
+    # Note: Unsloth's save_pretrained_gguf APPENDS "_gguf" to whatever path
+    # you give it. So passing "/content/kiki-gguf" actually writes to
+    # "/content/kiki-gguf_gguf/". We hunt in both locations to be robust.
     local_gguf_dir = Path("/content/kiki-gguf")
-    if local_gguf_dir.exists():
-        shutil.rmtree(local_gguf_dir)
+    unsloth_actual_dir = Path("/content/kiki-gguf_gguf")
+    for d in (local_gguf_dir, unsloth_actual_dir):
+        if d.exists():
+            shutil.rmtree(d)
     local_gguf_dir.mkdir(parents=True)
 
     _log(f"exporting GGUF (method={args.quantization})... this takes 5-15 min")
@@ -117,14 +122,21 @@ def main() -> None:
         sys.exit(1)
     _log(f"GGUF exported in {time.perf_counter() - t0:.1f}s")
 
-    # Find the .gguf file that Unsloth produced and copy to Drive
-    gguf_files = list(local_gguf_dir.glob("*.gguf"))
+    # Find the .gguf file that Unsloth produced and copy to Drive.
+    # Search BOTH the path we asked for and the "_gguf" suffix path Unsloth uses.
+    candidate_dirs = [unsloth_actual_dir, local_gguf_dir]
+    gguf_files: list[Path] = []
+    found_in: Path | None = None
+    for d in candidate_dirs:
+        if d.exists():
+            gguf_files = list(d.rglob("*.gguf"))
+            if gguf_files:
+                found_in = d
+                break
     if not gguf_files:
-        # Unsloth sometimes nests it
-        gguf_files = list(local_gguf_dir.rglob("*.gguf"))
-    if not gguf_files:
-        _log(f"no .gguf file found under {local_gguf_dir} — check Unsloth version")
+        _log(f"no .gguf file found under {[str(d) for d in candidate_dirs]} — check Unsloth version")
         sys.exit(1)
+    _log(f"located GGUF in {found_in}: {[f.name for f in gguf_files]}")
 
     for src in gguf_files:
         dst = gguf_out_drive / f"kiki-sft-v1-{args.quantization.upper()}.gguf"
@@ -133,18 +145,32 @@ def main() -> None:
         _log(f"✓ {dst}")
 
     # ------------------------------------------------------------------
-    # 4. Also write a Modelfile next to the GGUF for direct Ollama use
+    # 4. Modelfile — prefer the one Unsloth wrote (has the right TEMPLATE),
+    #    fall back to a minimal one if Unsloth didn't generate it.
     # ------------------------------------------------------------------
     modelfile_path = gguf_out_drive / "Modelfile"
-    modelfile_content = f"""FROM ./kiki-sft-v1-{args.quantization.upper()}.gguf
+    unsloth_modelfile = (found_in / "Modelfile") if found_in else None
+    if unsloth_modelfile and unsloth_modelfile.exists():
+        # Rewrite the FROM line to point at the renamed GGUF in Drive
+        original = unsloth_modelfile.read_text()
+        rewritten_lines = []
+        for line in original.splitlines():
+            if line.strip().lower().startswith("from "):
+                rewritten_lines.append(f"FROM ./kiki-sft-v1-{args.quantization.upper()}.gguf")
+            else:
+                rewritten_lines.append(line)
+        modelfile_path.write_text("\n".join(rewritten_lines) + "\n")
+        _log(f"wrote Modelfile (from Unsloth, FROM line rewritten) → {modelfile_path}")
+    else:
+        modelfile_content = f"""FROM ./kiki-sft-v1-{args.quantization.upper()}.gguf
 
 PARAMETER temperature 0.1
 PARAMETER num_ctx 4096
 PARAMETER num_predict 1024
 PARAMETER stop "<|im_end|>"
 """
-    modelfile_path.write_text(modelfile_content)
-    _log(f"wrote Modelfile → {modelfile_path}")
+        modelfile_path.write_text(modelfile_content)
+        _log(f"wrote Modelfile (minimal fallback) → {modelfile_path}")
 
     _log("DONE. To load into Ollama locally:")
     _log(f"  1. Download {gguf_out_drive}/kiki-sft-v1-*.gguf + Modelfile from Drive")
