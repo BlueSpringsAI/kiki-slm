@@ -2,11 +2,12 @@
 
 ## Executive Summary
 
-v1 shipped a working SLM that handles tool calling, multilingual responses, and structured JSON output. But production testing on ~50 real tickets revealed three quality gaps:
+v1 shipped a working SLM that handles tool calling, multilingual responses, and structured JSON output. But production testing on ~50 real tickets revealed four quality gaps:
 
 1. **Model skips `rag_search`** on ~20-30% of valid tickets → ungrounded responses that hallucinate policy
 2. **Responses are generic** ("I'll check shortly") instead of citing actual KB policy or asking for specific follow-ups
 3. **Rare categories fail** — refund_request (30 examples), price_negotiation (44), customer_feedback (33) are barely learned
+4. **Tone is transactional**, not warm — bare "Hello," greetings, no customer name personalization, formulaic closings instead of language-appropriate warmth (French "Cordialement", German "Mit freundlichen Grüßen", etc.)
 
 All three trace to the same root cause: **training data distribution and quality**, not model architecture or hyperparameters.
 
@@ -64,7 +65,25 @@ SLM (without KB context, reproducing the template):
 
 Both contain "shortly". But the teacher's version has a policy citation ("5 business days", "10% credit"). The SLM's version strips the substance and keeps the structure.
 
-### 1.3 The class imbalance catastrophe
+### 1.3 The transactional tone problem
+
+**Observed:** v1 responses lack warmth and personalization compared to the teacher:
+
+| Element | Teacher | v1 SLM |
+|---|---|---|
+| Greeting | "Hello Camille" (uses signed name) | "Hello," (generic) |
+| Acknowledgment | "about your order ORD-7745, I understand the urgency" | "Thank you for your message" |
+| Empathy on complaints | "We regret the issue with your order" | (often absent) |
+| Closing | "Looking forward to resolving this for you soon" | "I'll be in touch shortly" |
+| Language closings | "Cordialement", "Mit freundlichen Grüßen", "Cordiali saluti" | English-style "Best regards" leaks into all languages |
+
+**Root cause:**
+1. **Customer name not surfaced in reasoning** — the training reasoning_content doesn't explicitly extract and track the customer's name from the ticket signature, so the model doesn't learn to use it
+2. **Response length compression** — median response is 244 chars (very short). When the model compresses, the warmth elements get cut first because they're "optional"
+3. **No per-language tone validation** — the training data has French tickets that use English-style closings ("Best regards" instead of "Cordialement") because the teacher agent's response generation isn't language-aware enough
+4. **No empathy-marker training** — complaints, refunds, and quality issues need empathy phrases ("I'm sorry to hear", "We regret"), but these aren't consistently present in v1 training responses
+
+### 1.4 The class imbalance catastrophe
 
 ```
 Category             v1 Count    % of Data    Model's Learned Priority
@@ -422,7 +441,203 @@ Write the improved response:
 """
 ```
 
-### 5.2 Per-category response requirements
+### 5.2 Salutations, personalization, and warmth in tone
+
+**Observed in production:** Qiki LM responses are more transactional than the teacher's. They open with bare "Hello," and close with templated phrases. The teacher's responses use customer names, acknowledge the specific situation, and close with warmth that matches the language/culture of the ticket.
+
+**Side-by-side from eval (ticket 5517 — French refund):**
+
+```
+Teacher (warm, personalized):
+  "Hello Camille,
+   Thank you for reaching out about your order ORD-7745.
+   We have forwarded your refund request to our finance team for
+   review and will share the procedure and expected processing time
+   with you shortly.
+   Please let us know if you have any further questions in the meantime.
+   Looking forward to resolving this for you soon."
+
+SLM (transactional, generic):
+  "Hello,
+   Thank you for your refund request for order ORD-7745.
+   I will coordinate with our finance team to process your refund.
+   I will follow up with you shortly once the refund is processed.
+   Thank you for your understanding."
+```
+
+What the SLM is missing:
+1. **Customer name** ("Hello Camille") — the customer signed the email "Camille", but the SLM doesn't extract it
+2. **Specific situation acknowledgment** ("about your order ORD-7745") — too brief
+3. **Forward-looking warmth** ("Looking forward to resolving this for you soon") — replaced with bland "Thank you for your understanding"
+
+**Root cause:** Training responses contain warmth and personalization (the teacher learned this from Loopper's brand voice docs in the KB). But:
+1. The reasoning chain doesn't explicitly track customer name extraction
+2. Response length is short on average (median 244 chars), which encourages compression of warmth out
+3. No validation that responses include personalization or warm closings
+
+**Fix for v2 — three concrete changes:**
+
+#### (a) Extract and use customer name in the reasoning chain
+
+In `build_chatml_v2.py`, when building the reasoning_content, explicitly include name extraction:
+
+```python
+def build_response_reasoning(ticket_text: str, intent: str, rag_context: str) -> str:
+    """Build reasoning that explicitly notes customer name extraction."""
+    customer_name = extract_customer_name(ticket_text)  # heuristic from signature/header
+    
+    reasoning_parts = []
+    
+    if customer_name:
+        reasoning_parts.append(
+            f"Customer name detected: {customer_name}. Will personalize greeting."
+        )
+    
+    reasoning_parts.append(f"Retrieved context: {summarize_rag(rag_context)}")
+    reasoning_parts.append(f"Tone guidance from communication_guidelines: {extract_tone(rag_context)}")
+    reasoning_parts.append("Closing: warm, language-appropriate, forward-looking.")
+    
+    return "\n".join(reasoning_parts)
+```
+
+This teaches the model: when there's a customer name in the ticket, surface it in the reasoning, then USE it in the response.
+
+#### (b) Per-language salutation/closing validation
+
+Each language has appropriate openings and closings. Validate that the response uses them:
+
+```python
+LANGUAGE_TONE_REQUIREMENTS = {
+    "english": {
+        "must_have_greeting": ["Hello", "Hi", "Dear"],
+        "should_have_closing": ["Looking forward", "Best regards", "Thank you",
+                                 "Have a great", "Wishing you", "Talk soon"],
+    },
+    "french": {
+        "must_have_greeting": ["Bonjour", "Cher", "Chère"],
+        "should_have_closing": ["Cordialement", "Avec plaisir", "Dans l'attente",
+                                 "Merci de votre", "Au plaisir", "Belle journée",
+                                 "Bonne journée"],
+    },
+    "german": {
+        "must_have_greeting": ["Guten Tag", "Hallo", "Sehr geehrte", "Liebe"],
+        "should_have_closing": ["Freundliche Grüße", "Mit freundlichen Grüßen",
+                                 "Liebe Grüße", "Beste Grüße", "Schönen Tag"],
+    },
+    "spanish": {
+        "must_have_greeting": ["Hola", "Estimado", "Estimada", "Buenos días"],
+        "should_have_closing": ["Saludos cordiales", "Cordialmente", "Atentamente",
+                                 "Quedo a la espera", "Un saludo"],
+    },
+    "italian": {
+        "must_have_greeting": ["Buongiorno", "Salve", "Gentile"],
+        "should_have_closing": ["Cordiali saluti", "Distinti saluti",
+                                 "In attesa", "La ringrazio", "Buon proseguimento"],
+    },
+    "dutch": {
+        "must_have_greeting": ["Hallo", "Beste", "Goedendag"],
+        "should_have_closing": ["Met vriendelijke groet", "Vriendelijke groet",
+                                 "Hartelijk dank", "Fijne dag"],
+    },
+}
+
+def validate_warmth(response: str, language: str) -> list[str]:
+    """Check for language-appropriate greeting and warm closing."""
+    warnings = []
+    req = LANGUAGE_TONE_REQUIREMENTS.get(language)
+    if not req:
+        return warnings  # unsupported language, skip
+    
+    has_greeting = any(g in response for g in req["must_have_greeting"])
+    if not has_greeting:
+        warnings.append(f"Response missing language-appropriate greeting in {language}")
+    
+    has_closing = any(c in response for c in req["should_have_closing"])
+    if not has_closing:
+        warnings.append(f"Response missing warm closing in {language}")
+    
+    return warnings
+```
+
+Examples that fail this validation get flagged for re-generation.
+
+#### (c) Explicitly require personalization in the response prompt
+
+When re-generating template responses (Part 5.1), include personalization in the prompt:
+
+```python
+WARM_RESPONSE_PROMPT = """
+Rewrite this response with warmth, personalization, and language-appropriate tone.
+
+Required elements:
+1. **Greeting**: Use the customer's name if it appears in the ticket signature
+   (e.g., "Hello Camille" not "Hello,"). If no name, use a warm but generic
+   greeting in the customer's language.
+
+2. **Acknowledge the specific situation**: Reference the order number, the
+   product, or the specific concern they raised — not just generic
+   "thank you for your message."
+
+3. **Show empathy when appropriate**: For complaints, refunds, delays, or
+   quality issues, include a brief empathy phrase:
+   - English: "We're sorry to hear", "I understand the urgency"
+   - French: "Nous sommes navrés", "Je comprends votre préoccupation"
+   - German: "Es tut uns leid", "Wir verstehen Ihre Sorge"
+   - Spanish: "Lamentamos", "Entendemos su preocupación"
+   - Italian: "Ci dispiace", "Comprendiamo la sua preoccupazione"
+
+4. **Forward-looking close**: End with something warm and forward-looking,
+   not just "I'll be in touch shortly":
+   - English: "Looking forward to resolving this for you soon"
+   - French: "Au plaisir de vous tenir informé"
+   - German: "Wir freuen uns, Ihnen helfen zu können"
+   - Spanish: "Quedo a su disposición"
+   - Italian: "Resto a sua disposizione"
+
+5. **Match Loopper's brand voice**: Warm, professional, never dismissive.
+
+Customer ticket: {ticket_text}
+Customer name detected: {customer_name}
+Detected language: {language}
+Category: {category}
+KB context: {rag_results}
+Sign-off: Marc Logier, Account Manager — Loopper
+
+Original response (too transactional):
+{original_response}
+
+Rewrite the response. Output only the response text, no JSON wrapping.
+"""
+```
+
+#### Customer name extraction (lightweight heuristic)
+
+```python
+import re
+
+NAME_PATTERNS = [
+    # Pattern 1: signature line "Best regards, NAME"
+    r"(?:best regards|cordialement|mit freundlichen grüßen|saludos|cordiali saluti),?\s*([A-Z][a-zà-ÿ]+(?:\s+[A-Z][a-zà-ÿ]+)?)",
+    # Pattern 2: signature line "Thanks, NAME"
+    r"(?:thanks|merci|danke|gracias|grazie),?\s*([A-Z][a-zà-ÿ]+(?:\s+[A-Z][a-zà-ÿ]+)?)\s*$",
+    # Pattern 3: signed at the end "NAME\nemail" or "NAME\n+phone"
+    r"\n([A-Z][a-zà-ÿ]+(?:\s+[A-Z][a-zà-ÿ]+)?)\n[\w.]+@",
+    # Pattern 4: PII placeholder
+    r"<PII_NAME[:_][a-z0-9]+>",
+]
+
+def extract_customer_name(ticket_text: str) -> str | None:
+    """Best-effort extraction of customer name from ticket text."""
+    for pattern in NAME_PATTERNS:
+        match = re.search(pattern, ticket_text, re.IGNORECASE | re.MULTILINE)
+        if match:
+            return match.group(1) if match.lastindex else "[NAME]"
+    return None
+```
+
+For tickets where the name is a PII placeholder (`<PII_NAME:abc123>`), the response should use `[NAME]` as the placeholder so the agent's PII restoration step puts the real name back at delivery time.
+
+### 5.3 Per-category response requirements
 
 Each category has specific information the response SHOULD contain. Validate in `build_chatml_v2.py`:
 
@@ -614,6 +829,9 @@ def validate_v2_dataset(dataset_path: str) -> dict:
         "collection_names_valid": 0,
         "response_not_template": 0,
         "category_specific_content": 0,
+        "warmth_greeting_present": 0,    # language-appropriate greeting
+        "warmth_closing_present": 0,     # language-appropriate warm closing
+        "personalization_when_name_available": 0,  # uses customer name when present
         "rejection_ratio": 0,
     }
     
@@ -642,15 +860,19 @@ def validate_v2_dataset(dataset_path: str) -> dict:
 ### Post-training evaluation (run on gold_100 + new gold examples)
 
 ```
-Metric                  v1 Result    v2 Target    Gate
-─────────────────────────────────────────────────────────────
-intent_accuracy           51%          75%         ≥70%
-urgency_accuracy          59%          75%         ≥65%
-is_valid_accuracy         88%          95%         ≥90%
-tool_call_rate (valid)    ~70%*        95%         ≥90%
-json_strict_parse         ~60%*        95%         ≥90%
-response_has_substance    ~40%*        80%         ≥70%
-avg_turns                 3.05         2.5         1.5-3.5
+Metric                       v1 Result    v2 Target    Gate
+──────────────────────────────────────────────────────────────────
+intent_accuracy                51%          75%         ≥70%
+urgency_accuracy               59%          75%         ≥65%
+is_valid_accuracy              88%          95%         ≥90%
+tool_call_rate (valid)         ~70%*        95%         ≥90%
+json_strict_parse              ~60%*        95%         ≥90%
+response_has_substance         ~40%*        80%         ≥70%
+language_appropriate_greeting   ~85%*        95%         ≥90%
+language_appropriate_closing    ~50%*        90%         ≥80%
+uses_customer_name_when_present ~10%*        70%         ≥60%
+empathy_on_complaint_tickets    ~30%*        80%         ≥70%
+avg_turns                      3.05         2.5         1.5-3.5
 
 * estimated from production testing, not formal eval
 ```
@@ -678,6 +900,10 @@ If any gate fails, investigate before deploying. Do NOT ship a model that regres
 - [ ] Make rejection reasoning structurally distinct (short + declarative)
 - [ ] Flag template responses ("I'll check shortly") for re-generation
 - [ ] Re-generate flagged responses with specific-response prompt
+- [ ] Extract customer names from ticket signatures and surface in reasoning_content
+- [ ] Validate per-language greetings and warm closings (English/French/German/Spanish/Italian/Dutch)
+- [ ] Validate empathy markers on complaint/refund/quality tickets
+- [ ] Re-generate responses that fail warmth/personalization validation
 - [ ] Validate per-category response requirements
 - [ ] Run `trim_chatml.py` (same as v1)
 - [ ] Run `validate_dataset_v2.py` — all gates must pass
@@ -739,6 +965,10 @@ Learning rate:          2e-4                       1.5e-4
 Dropout:                0                          0.05
 
 Response quality:       27% "shortly" templates    <10%
+Tone:                   Transactional, generic     Warm, personalized, language-appropriate
+Customer name usage:    Rare (~10%)                Frequent (~70% when name available)
+Per-language closings:  Mixed (English leaks)      Validated per-language
+Empathy on complaints:  Inconsistent               Required by validation
 Tool-call enforcement:  Data-level only            Data + structural separation + DPO
 Collection names:       Mixed (verbose + short)    Normalized (short only)
 Rejection format:       Detailed (same as valid)   Short + distinctive
